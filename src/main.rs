@@ -7,7 +7,8 @@ mod payload;
 mod ui;
 
 use anyhow::{Context, Result, bail};
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use ratatui::crossterm::execute;
 use tokio::sync::mpsc;
 
 use crate::app::{App, AppEvent};
@@ -34,6 +35,7 @@ async fn main() -> Result<()> {
         while let Ok(ev) = event::read() {
             let event = match ev {
                 Event::Key(key) => AppEvent::Key(key),
+                Event::Mouse(mouse) => AppEvent::Mouse(mouse),
                 _ => AppEvent::Redraw,
             };
             if input_tx.send(event).is_err() {
@@ -46,6 +48,7 @@ async fn main() -> Result<()> {
     app.refresh_board();
 
     let mut terminal = ratatui::init();
+    execute!(std::io::stdout(), EnableMouseCapture)?;
     let result = async {
         while !app.quit {
             terminal.draw(|f| ui::draw(f, &mut app))?;
@@ -57,6 +60,7 @@ async fn main() -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
