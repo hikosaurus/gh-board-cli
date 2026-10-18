@@ -24,6 +24,12 @@ gh-board-cli "<owner>/<repo>"
 | `Tab` | ペイン切替 |
 | `j` / `k` / `↑` / `↓` | スクロール |
 | `G` / `End` | イベントログの末尾に追従 |
+| クリック (`#n ...`) | Issue をブラウザで開く (`gh issue view --web`) |
+| ホイール | カーソル下のペインをスクロール |
+
+- 左ペインは Project の Status ごとに Issue を表示します（Done は更新日時が新しい順に最大10件）
+- 🟢 はその Issue のイベントに一致した Hook を実行中であることを示します
+- マウス入力を有効にしているため、ターミナルでの文字選択は Shift (iTerm2 / Terminal.app では Option) を押しながら行ってください
 
 ## 設定 (`.ghboard.json`)
 
