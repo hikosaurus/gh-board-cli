@@ -3,6 +3,9 @@ use serde_json::Value;
 use tokio::process::Command;
 
 const NO_STATUS: &str = "No Status";
+const DONE: &str = "Done";
+/// Max issues shown in the Done column (recently updated first)
+const DONE_LIMIT: usize = 10;
 
 const QUERY: &str = r#"
 query($owner: String!, $repo: String!, $after: String) {
@@ -21,7 +24,7 @@ query($owner: String!, $repo: String!, $after: String) {
               ... on ProjectV2ItemFieldSingleSelectValue { name }
             }
             content {
-              ... on Issue { number title repository { nameWithOwner } }
+              ... on Issue { number title updatedAt repository { nameWithOwner } }
             }
           }
         }
@@ -35,6 +38,8 @@ query($owner: String!, $repo: String!, $after: String) {
 pub struct Issue {
     pub number: u64,
     pub title: String,
+    /// ISO 8601 (sortable as string)
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,7 +81,17 @@ pub async fn fetch(repository: &str) -> Result<Board> {
     board
         .columns
         .retain(|c| c.name != NO_STATUS || !c.issues.is_empty());
+    limit_done(&mut board);
     Ok(board)
+}
+
+fn limit_done(board: &mut Board) {
+    for column in board.columns.iter_mut().filter(|c| c.name == DONE) {
+        column
+            .issues
+            .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        column.issues.truncate(DONE_LIMIT);
+    }
 }
 
 async fn query(owner: &str, repo: &str, after: Option<&str>) -> Result<Value> {
@@ -154,6 +169,10 @@ fn add_items(board: &mut Board, repository: &str, project: &Value) {
         column.issues.push(Issue {
             number,
             title: title.to_string(),
+            updated_at: content["updatedAt"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
         });
     }
 }
@@ -201,5 +220,33 @@ mod tests {
                 (NO_STATUS, vec![4])
             ]
         );
+    }
+
+    #[test]
+    fn limit_done_to_recent_issues() {
+        let issues = (1..=12)
+            .map(|n| Issue {
+                number: n,
+                title: format!("i{n}"),
+                updated_at: format!("2026-10-{n:02}T00:00:00Z"),
+            })
+            .collect::<Vec<_>>();
+        let mut board = Board {
+            columns: vec![
+                Column {
+                    name: "Todo".into(),
+                    issues: issues.clone(),
+                },
+                Column {
+                    name: DONE.into(),
+                    issues,
+                },
+            ],
+            ..Default::default()
+        };
+        limit_done(&mut board);
+        assert_eq!(board.columns[0].issues.len(), 12);
+        let done: Vec<_> = board.columns[1].issues.iter().map(|i| i.number).collect();
+        assert_eq!(done, (3..=12).rev().collect::<Vec<_>>());
     }
 }
