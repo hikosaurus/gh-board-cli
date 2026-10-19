@@ -1,0 +1,422 @@
+use std::collections::HashMap;
+use std::process::Stdio;
+
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
+use tokio::process::Command;
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::board::{self, Board};
+use crate::config::{Config, HookAction};
+use crate::hook::{self, CommandOutput, CommentTracker};
+use crate::payload::Payload;
+
+/// `(lowercased repository, issue number)`
+pub type IssueKey = (String, u64);
+
+pub fn issue_key(repository: &str, number: u64) -> IssueKey {
+    (repository.to_ascii_lowercase(), number)
+}
+
+#[derive(Debug)]
+pub enum AppEvent {
+    Key(KeyEvent),
+    Mouse(MouseEvent),
+    /// Terminal event other than key (e.g. resize)
+    Redraw,
+    /// WebSocket connection status
+    Status(String),
+    /// Payload received from WebSocket
+    Received(Payload),
+    /// Hook action finished
+    HookDone(Option<IssueKey>, CommandOutput),
+    /// Hook actions were not run (issue, count of actions, reason)
+    HookSkipped(Option<IssueKey>, usize, String),
+    Board(Result<Board, String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LogKind {
+    Event,
+    Skipped,
+    Command,
+    Stdout,
+    Stderr,
+    Exit,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub kind: LogKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Focus {
+    Board,
+    Log,
+}
+
+pub struct App {
+    config: Config,
+    tx: UnboundedSender<AppEvent>,
+    hook_tx: UnboundedSender<HookJob>,
+
+    pub board: Option<Board>,
+    pub board_error: Option<String>,
+    pub loading: bool,
+    /// Refresh requested while loading
+    refresh_pending: bool,
+    /// Issue -> count of hook actions not yet finished
+    pub active_issues: HashMap<IssueKey, usize>,
+    pub log: Vec<LogLine>,
+    pub status: String,
+
+    pub focus: Focus,
+    pub board_scroll: u16,
+    /// `None` follows the latest log
+    pub log_scroll: Option<u16>,
+    /// Scroll position of the bottom of the log, updated by the renderer
+    pub log_bottom_hint: u16,
+    /// Pane areas and clickable issue rows, updated by the renderer
+    pub board_area: Rect,
+    pub log_area: Rect,
+    pub issue_links: Vec<(Rect, IssueKey)>,
+    pub quit: bool,
+}
+
+type HookJob = (Payload, Vec<HookAction>);
+
+impl App {
+    pub fn new(config: Config, tx: UnboundedSender<AppEvent>) -> Self {
+        let hook_tx = spawn_hook_worker(tx.clone());
+        Self {
+            config,
+            tx,
+            hook_tx,
+            board: None,
+            board_error: None,
+            loading: false,
+            refresh_pending: false,
+            active_issues: HashMap::new(),
+            log: vec![],
+            status: String::new(),
+            focus: Focus::Board,
+            board_scroll: 0,
+            log_scroll: None,
+            log_bottom_hint: 0,
+            board_area: Rect::default(),
+            log_area: Rect::default(),
+            issue_links: vec![],
+            quit: false,
+        }
+    }
+
+    pub fn refresh_board(&mut self) {
+        if self.loading {
+            self.refresh_pending = true;
+            return;
+        }
+        self.loading = true;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = board::fetch().await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send(AppEvent::Board(result));
+        });
+    }
+
+    pub fn handle(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Key(key) => self.on_key(key),
+            AppEvent::Mouse(mouse) => self.on_mouse(mouse),
+            AppEvent::Redraw => {}
+            AppEvent::Status(status) => self.status = status,
+            AppEvent::Received(payload) => self.on_received(payload),
+            AppEvent::HookDone(issue, output) => self.on_hook_done(issue, output),
+            AppEvent::HookSkipped(issue, count, reason) => {
+                self.finish_actions(issue.as_ref(), count);
+                self.push(LogKind::Skipped, format!("  skipped: {reason}"));
+            }
+            AppEvent::Board(result) => {
+                self.loading = false;
+                match result {
+                    Ok(board) => {
+                        self.board = Some(board);
+                        self.board_error = None;
+                    }
+                    Err(e) => self.board_error = Some(e),
+                }
+                if std::mem::take(&mut self.refresh_pending) {
+                    self.refresh_board();
+                }
+            }
+        }
+    }
+
+    fn on_key(&mut self, key: KeyEvent) {
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
+            KeyCode::Char('r') => self.refresh_board(),
+            KeyCode::Tab => {
+                self.focus = match self.focus {
+                    Focus::Board => Focus::Log,
+                    Focus::Log => Focus::Board,
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.scroll(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll(-1),
+            KeyCode::Char('G') | KeyCode::End if self.focus == Focus::Log => self.log_scroll = None,
+            _ => {}
+        }
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        let pos = Position::new(mouse.column, mouse.row);
+        let pane = if self.board_area.contains(pos) {
+            Focus::Board
+        } else if self.log_area.contains(pos) {
+            Focus::Log
+        } else {
+            return;
+        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.focus = pane;
+                let link = self.issue_links.iter().find(|(r, _)| r.contains(pos));
+                if let Some((_, (repository, number))) = link.cloned() {
+                    self.open_issue(repository, number);
+                }
+            }
+            MouseEventKind::ScrollDown => self.scroll_pane(pane, 1),
+            MouseEventKind::ScrollUp => self.scroll_pane(pane, -1),
+            _ => {}
+        }
+    }
+
+    fn open_issue(&mut self, repository: String, number: u64) {
+        self.status = format!("opening {repository}#{number}");
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = Command::new("gh")
+                .args(["issue", "view", &number.to_string(), "--web"])
+                .args(["-R", &repository])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+                .await;
+            let status = match result {
+                Ok(o) if o.status.success() => format!("opened {repository}#{number}"),
+                Ok(o) => format!("gh: {}", String::from_utf8_lossy(&o.stderr).trim()),
+                Err(e) => format!("gh: {e}"),
+            };
+            let _ = tx.send(AppEvent::Status(status));
+        });
+    }
+
+    fn scroll(&mut self, delta: i32) {
+        self.scroll_pane(self.focus, delta);
+    }
+
+    fn scroll_pane(&mut self, pane: Focus, delta: i32) {
+        let apply = |v: u16| (v as i32 + delta).max(0) as u16;
+        match pane {
+            Focus::Board => self.board_scroll = apply(self.board_scroll),
+            Focus::Log => {
+                // Detach from the bottom using the last rendered position
+                let current = self.log_scroll.unwrap_or(self.log_bottom_hint);
+                self.log_scroll = Some(apply(current));
+            }
+        }
+    }
+
+    fn on_received(&mut self, payload: Payload) {
+        let hook_type = payload.hook_type();
+        let issue = payload
+            .issue_number
+            .map(|n| format!("#{n} "))
+            .unwrap_or_default();
+
+        if !self.config.is_target(&payload.repository) {
+            self.push(
+                LogKind::Skipped,
+                format!(
+                    "⚡️ {issue}{hook_type} ({}: not in targets)",
+                    payload.repository
+                ),
+            );
+            return;
+        }
+
+        self.push(
+            LogKind::Event,
+            format!("⚡️ {issue}{hook_type} ({})", payload.repository),
+        );
+
+        let actions: Vec<HookAction> = hook::select(&self.config, &payload)
+            .into_iter()
+            .cloned()
+            .collect();
+        if !actions.is_empty() {
+            if let Some(n) = payload.issue_number {
+                *self
+                    .active_issues
+                    .entry(issue_key(&payload.repository, n))
+                    .or_default() += actions.len();
+            }
+            let _ = self.hook_tx.send((payload, actions));
+        }
+        self.refresh_board();
+    }
+
+    fn on_hook_done(&mut self, issue: Option<IssueKey>, output: CommandOutput) {
+        self.finish_actions(issue.as_ref(), 1);
+        self.push(LogKind::Command, format!("  $ {}", output.command));
+        for line in output.stdout.lines() {
+            self.push(LogKind::Stdout, format!("    {line}"));
+        }
+        for line in output.stderr.lines() {
+            self.push(LogKind::Stderr, format!("    {line}"));
+        }
+        let status = output
+            .status
+            .map_or("killed".to_string(), |c| c.to_string());
+        self.push(LogKind::Exit, format!("    exit {status}"));
+    }
+
+    fn finish_actions(&mut self, issue: Option<&IssueKey>, count: usize) {
+        if let Some(key) = issue
+            && let Some(remaining) = self.active_issues.get_mut(key)
+        {
+            *remaining = remaining.saturating_sub(count);
+            if *remaining == 0 {
+                self.active_issues.remove(key);
+            }
+        }
+    }
+
+    fn push(&mut self, kind: LogKind, text: String) {
+        self.log.push(LogLine { kind, text });
+    }
+}
+
+/// Run hook actions sequentially so that outputs keep the order of events.
+///
+/// For issue events, actions run only when the last comment of the issue
+/// changed since the previous check (or it is the first check).
+fn spawn_hook_worker(tx: UnboundedSender<AppEvent>) -> UnboundedSender<HookJob> {
+    let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<HookJob>();
+    tokio::spawn(async move {
+        let mut tracker = CommentTracker::default();
+        while let Some((payload, actions)) = hook_rx.recv().await {
+            let issue = payload
+                .issue_number
+                .map(|n| issue_key(&payload.repository, n));
+
+            if let Some(n) = payload.issue_number {
+                let skipped = match hook::latest_comment(&payload.repository, n).await {
+                    Ok(comment) => (!tracker.update(&payload.repository, n, comment))
+                        .then(|| "no new comment".to_string()),
+                    Err(e) => Some(e),
+                };
+                if let Some(reason) = skipped {
+                    let reason = format!("{} #{n}: {reason}", payload.hook_type());
+                    let event = AppEvent::HookSkipped(issue, actions.len(), reason);
+                    if tx.send(event).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+
+            for action in &actions {
+                let output = hook::run(action, &payload).await;
+                if tx.send(AppEvent::HookDone(issue.clone(), output)).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    hook_tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn output() -> CommandOutput {
+        CommandOutput {
+            command: "true".into(),
+            stdout: String::new(),
+            stderr: String::new(),
+            status: Some(0),
+        }
+    }
+
+    fn payload(repository: &str, event_name: &str) -> Payload {
+        Payload::from_value(json!({
+            "repository": repository,
+            "event_name": event_name,
+            "event_action": "opened",
+            "issue_number": 3
+        }))
+        .unwrap()
+    }
+
+    fn app(config: &str) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(Config::parse(config).unwrap(), tx)
+    }
+
+    #[tokio::test]
+    async fn active_issue_is_cleared_after_actions_finish() {
+        let mut app = app(r#"{
+            "listen": "ws://x",
+            "hooks": {
+                "issues:*": [
+                    { "type": "command", "command": "true" },
+                    { "type": "command", "command": "true" }
+                ]
+            }
+        }"#);
+        let key = issue_key("Owner/Repo", 3);
+
+        // no matching hook -> not marked
+        app.handle(AppEvent::Received(payload("owner/repo", "issue_comment")));
+        assert!(app.active_issues.is_empty());
+
+        app.handle(AppEvent::Received(payload("Owner/Repo", "issues")));
+        assert_eq!(app.active_issues.get(&key), Some(&2));
+        app.handle(AppEvent::HookDone(Some(key.clone()), output()));
+        assert_eq!(app.active_issues.get(&key), Some(&1));
+        app.handle(AppEvent::HookDone(Some(key.clone()), output()));
+        assert!(app.active_issues.is_empty());
+
+        // skipped actions also clear the mark
+        app.handle(AppEvent::Received(payload("owner/repo", "issues")));
+        app.handle(AppEvent::HookSkipped(Some(key), 2, "no new comment".into()));
+        assert!(app.active_issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ignore_repositories_not_in_targets() {
+        let mut app = app(r#"{
+            "listen": "ws://x",
+            "targets": ["owner/repo"],
+            "hooks": { "issues:*": [{ "type": "command", "command": "true" }] }
+        }"#);
+        app.handle(AppEvent::Received(payload("owner/other", "issues")));
+        assert!(app.active_issues.is_empty());
+        assert_eq!(app.log.last().unwrap().kind, LogKind::Skipped);
+
+        app.handle(AppEvent::Received(payload("owner/repo", "issues")));
+        assert_eq!(app.active_issues.len(), 1);
+    }
+}
