@@ -65,12 +65,23 @@ fn lookup(path: &str, payload: &Payload) -> Option<String> {
 /// Last issue comment `(id, body)`; `None` when the issue has no comments.
 pub type Comment = Option<(String, String)>;
 
-/// Fetch the last comment of the issue with
-/// `gh issue view <n> -R <repo> --json comments --jq '.comments[-1]'`.
-pub async fn latest_comment(repository: &str, number: u64) -> Result<Comment, String> {
+/// Issue state used to decide whether hook actions run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IssueState {
+    pub comment: Comment,
+    /// Status of the issue in each project it belongs to.
+    pub statuses: Vec<String>,
+}
+
+const ISSUE_STATE_JQ: &str =
+    "{comment: .comments[-1], statuses: [.projectItems[].status.name | select(. != null)]}";
+
+/// Fetch the last comment and project statuses of the issue with
+/// `gh issue view <n> -R <repo> --json comments,projectItems`.
+pub async fn issue_state(repository: &str, number: u64) -> Result<IssueState, String> {
     let output = Command::new("gh")
         .args(["issue", "view", &number.to_string(), "-R", repository])
-        .args(["--json", "comments", "--jq", ".comments[-1]"])
+        .args(["--json", "comments,projectItems", "--jq", ISSUE_STATE_JQ])
         .stdin(Stdio::null())
         .output()
         .await
@@ -81,17 +92,25 @@ pub async fn latest_comment(repository: &str, number: u64) -> Result<Comment, St
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    parse_comment(&String::from_utf8_lossy(&output.stdout))
+    parse_issue_state(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn parse_comment(text: &str) -> Result<Comment, String> {
-    let text = text.trim();
-    if text.is_empty() || text == "null" {
-        return Ok(None);
-    }
-    let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    let field = |key: &str| value[key].as_str().unwrap_or_default().to_string();
-    Ok(Some((field("id"), field("body"))))
+fn parse_issue_state(text: &str) -> Result<IssueState, String> {
+    let value: Value = serde_json::from_str(text.trim()).map_err(|e| e.to_string())?;
+    let comment = match &value["comment"] {
+        Value::Null => None,
+        c => {
+            let field = |key: &str| c[key].as_str().unwrap_or_default().to_string();
+            Some((field("id"), field("body")))
+        }
+    };
+    let statuses = value["statuses"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_str().map(str::to_string))
+        .collect();
+    Ok(IssueState { comment, statuses })
 }
 
 /// Remembers the last comment of each issue to detect new comments.
@@ -118,7 +137,7 @@ pub struct CommandOutput {
 }
 
 pub async fn run(action: &HookAction, payload: &Payload) -> CommandOutput {
-    let HookAction::Command { command } = action;
+    let HookAction::Command { command, .. } = action;
     let command = expand(command, payload);
     let output = Command::new("sh")
         .arg("-c")
@@ -202,6 +221,7 @@ mod tests {
         assert_eq!(
             selected,
             vec![&HookAction::Command {
+                status: vec![],
                 command: "a".into()
             }]
         );
@@ -211,6 +231,7 @@ mod tests {
     async fn run_command() {
         let out = run(
             &HookAction::Command {
+                status: vec![],
                 command: "echo ${{ issue_number }}; echo err >&2; exit 2".into(),
             },
             &payload(),
@@ -223,14 +244,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_last_comment() {
-        assert_eq!(parse_comment(""), Ok(None));
-        assert_eq!(parse_comment("null\n"), Ok(None));
+    fn parse_state() {
         assert_eq!(
-            parse_comment(r#"{"id":"IC_1","body":"hi","author":{"login":"me"}}"#),
-            Ok(Some(("IC_1".into(), "hi".into())))
+            parse_issue_state(r#"{"comment":null,"statuses":[]}"#),
+            Ok(IssueState {
+                comment: None,
+                statuses: vec![]
+            })
         );
-        assert!(parse_comment("{").is_err());
+        assert_eq!(
+            parse_issue_state(
+                r#"{"comment":{"id":"IC_1","body":"hi","author":{"login":"me"}},"statuses":["Todo","Done"]}"#
+            ),
+            Ok(IssueState {
+                comment: Some(("IC_1".into(), "hi".into())),
+                statuses: vec!["Todo".into(), "Done".into()]
+            })
+        );
+        assert!(parse_issue_state("{").is_err());
     }
 
     #[test]
