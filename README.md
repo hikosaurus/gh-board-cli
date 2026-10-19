@@ -41,10 +41,10 @@ gh-board-cli "<owner>/<repo>"
   "channel": "gh-board",
   "hooks": {
     "issues:*": [
-      { "type": "command", "command": "echo ${{ event.issue.id }}" }
+      { "type": "command", "command": "echo ${{ issue_number }}" }
     ],
     "issue_comment:created": [
-      { "type": "command", "command": "echo ${{ event.comment.body }}" }
+      { "type": "command", "command": "echo ${{ event_name }}:${{ event_action }} #${{ issue_number }}" }
     ]
   }
 }
@@ -53,15 +53,16 @@ gh-board-cli "<owner>/<repo>"
 - `listen`: 購読する WebSocket の URL
 - `channel` (任意): Pusher のチャンネル名。指定時は接続後に `pusher:subscribe` を送信します
 - `hooks`: HookType → HookAction の配列
-  - HookType: `{event_name}:{event.action}`。`*` は任意の文字列に一致します
+  - HookType: `{event_name}:{event_action}`。`*` は任意の文字列に一致します
   - HookAction: `{ "type": "command", "command": "..." }` を `sh -c` で実行します
 
 ### 組み込み変数
 
-`${{ 変数名 }}` で埋め込めます。`.` 区切りでフィールド、数字で配列要素を参照できます（例: `${{ event.issue.labels.0.name }}`）。文字列以外の値は JSON として展開されます。
+`${{ 変数名 }}` で埋め込めます。payload の各項目名がそのまま変数名になります（`repository` / `event_name` / `event_action` / `issue_number`、およびそれ以外に含まれる項目）。
 
-- `event_name`: `github.event_name` の内容
-- `event`: `github.event` の内容
+- 存在しない変数は空文字に展開されます
+- 文字列以外の値は JSON として展開されます
+- 値がオブジェクト・配列の場合は `.` 区切りで中身を参照できます（例: `${{ issue.labels.0.name }}`）
 
 > [!WARNING]
 > 変数はエスケープせずにコマンドへ展開されます。Issue タイトルやコメント本文など外部入力をシェルに渡す場合は注意してください。
@@ -72,9 +73,15 @@ gh-board-cli "<owner>/<repo>"
 {
   "repository": "owner/repo",
   "event_name": "issues",
-  "event": { "action": "opened", "...": "..." }
+  "event_action": "opened",
+  "issue_number": 1
 }
 ```
+
+- `repository`: リポジトリ名 (`{owner}/{repo}`)
+- `event_name`: `github.event_name` の内容（`issues`, `issue_comment` など）
+- `event_action`: `github.event.action` の内容（省略時は空文字）
+- `issue_number`: Issue 番号（数値または数字の文字列）。🟢 の表示に使います
 
 Pusher の envelope（`{"event": "...", "data": "<payload の JSON 文字列>"}`）で届いた場合は `data` を展開します。`repository` が引数と一致しないイベントは Hook を実行しません。
 
