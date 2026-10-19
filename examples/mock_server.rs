@@ -1,7 +1,7 @@
 //! Pusher-like mock WebSocket server for local development.
 //!
 //! usage: cargo run --example mock_server -- <owner>/<repo> [port]
-//! then set `"listen": "ws://127.0.0.1:<port>"` in `.ghboard.json`.
+//! then set `listen: ws://127.0.0.1:<port>` in `.ghboard.yaml`.
 
 use std::time::Duration;
 

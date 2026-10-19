@@ -143,6 +143,29 @@ hooks:
     }
 
     #[test]
+    fn parse_readme_example() {
+        let readme = include_str!("../README.md");
+        let example = readme
+            .split("```yaml\n")
+            .nth(1)
+            .and_then(|s| s.split("```").next())
+            .unwrap();
+        let config = Config::parse(example).unwrap();
+        assert_eq!(
+            config.hooks["issue_comment:created"],
+            vec![HookAction::Command {
+                status: vec![],
+                command: r#"echo "${{ event_name }}:${{ event_action }} #${{ issue_number }}""#
+                    .into()
+            }]
+        );
+        assert_eq!(
+            config.hooks["issues:*"][0].statuses(),
+            ["In Progress", "In Review"]
+        );
+    }
+
+    #[test]
     fn parse_json_style() {
         // YAML is a superset of JSON, so the former JSON config still parses.
         let config = Config::parse(
