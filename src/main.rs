@@ -12,7 +12,7 @@ use ratatui::crossterm::execute;
 use tokio::sync::mpsc;
 
 use crate::app::{App, AppEvent};
-use crate::config::{CONFIG_FILE_NAME, Config};
+use crate::config::{CONFIG_FILE_NAMES, Config};
 
 const USAGE: &str = "usage: gh-board-cli";
 
@@ -21,7 +21,8 @@ async fn main() -> Result<()> {
     if std::env::args().len() > 1 {
         bail!(USAGE);
     }
-    let path = Config::find().with_context(|| format!("{CONFIG_FILE_NAME} not found"))?;
+    let path =
+        Config::find().with_context(|| format!("{} not found", CONFIG_FILE_NAMES.join(" or ")))?;
     let config = Config::load(&path)?;
 
     let (tx, mut rx) = mpsc::unbounded_channel();

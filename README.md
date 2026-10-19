@@ -31,32 +31,38 @@ gh-board-cli
 - 🟢 はその Issue のイベントに一致した Hook を実行中であることを示します
 - マウス入力を有効にしているため、ターミナルでの文字選択は Shift (iTerm2 / Terminal.app では Option) を押しながら行ってください
 
-## 設定 (`.ghboard.json`)
+## 設定 (`.ghboard.yaml`)
 
-カレントディレクトリ、なければホームディレクトリの `.ghboard.json` を読み込みます。
+YAML 形式の設定ファイルを、次の順で探して最初に見つかったものを読み込みます。
 
-```json
-{
-  "listen": "wss://ws-{cluster}.pusher.com/app/{app_key}?protocol=7&client=rust&version=1.0.0",
-  "channel": "gh-board",
-  "targets": ["owner/repo01", "owner/repo02"],
-  "hooks": {
-    "issues:*": [
-      { "type": "command", "status": ["In Progress", "In Review"], "command": "echo ${{ issue_number }}" }
-    ],
-    "issue_comment:created": [
-      { "type": "command", "command": "echo ${{ event_name }}:${{ event_action }} #${{ issue_number }}" }
-    ]
-  }
-}
+1. カレントディレクトリの `.ghboard.yaml` → `.ghboard.yml`
+2. ホームディレクトリの `.ghboard.yaml` → `.ghboard.yml`
+
+```yaml
+listen: wss://ws-{cluster}.pusher.com/app/{app_key}?protocol=7&client=rust&version=1.0.0
+channel: gh-board
+targets:
+  - owner/repo01
+  - owner/repo02
+hooks:
+  issues:*:
+    - type: command
+      status: [In Progress, In Review]
+      command: echo ${{ issue_number }}
+  issue_comment:created:
+    - type: command
+      command: 'echo "${{ event_name }}:${{ event_action }} #${{ issue_number }}"'
 ```
+
+> [!TIP]
+> YAML では、値に ` #`（コメント扱い）や `: ` が含まれると意図どおりに読み込まれません。`command` はクォートで囲むと安全です。
 
 - `listen`: 購読する WebSocket の URL
 - `channel` (任意): Pusher のチャンネル名。指定時は接続後に `pusher:subscribe` を送信します
 - `targets` (任意): Hook の対象リポジトリ。空・未指定なら全リポジトリが対象です
 - `hooks`: HookType → HookAction の配列
   - HookType: `{event_name}:{event_action}`。`*` は任意の文字列に一致します
-  - HookAction: `{ "type": "command", "status": [...], "command": "..." }`
+  - HookAction: `type: command` と `command`、任意で `status`
     - `command`: `sh -c` で実行するコマンド
     - `status` (任意): 実行対象とする Issue の Project ステータス。空・未指定ならステータスに関係なく実行します
 
