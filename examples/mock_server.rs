@@ -40,25 +40,17 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let events = [
-                (
-                    "issues",
-                    json!({ "action": "opened", "issue": { "id": 1001, "number": 1, "title": "prototype" } }),
-                ),
-                (
-                    "issue_comment",
-                    json!({ "action": "created", "issue": { "id": 1001, "number": 1 }, "comment": { "body": "hello" } }),
-                ),
-                (
-                    "issues",
-                    json!({ "action": "labeled", "issue": { "id": 1001, "number": 1 } }),
-                ),
+                ("issues", "opened"),
+                ("issue_comment", "created"),
+                ("issues", "labeled"),
             ];
-            for (event_name, event) in events {
+            for (event_name, event_action) in events {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let payload = json!({
                     "repository": repository,
                     "event_name": event_name,
-                    "event": event
+                    "event_action": event_action,
+                    "issue_number": 1
                 });
                 let envelope = json!({
                     "event": "github",
