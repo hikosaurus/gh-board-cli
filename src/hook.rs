@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
 use crate::config::{Config, HookAction};
@@ -128,36 +129,67 @@ impl CommentTracker {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct CommandOutput {
-    pub command: String,
-    pub stdout: String,
-    pub stderr: String,
-    pub status: Option<i32>,
+/// Progress of a running hook action.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HookOutput {
+    /// The command (with variables expanded) was started
+    Started(String),
+    Stdout(String),
+    Stderr(String),
 }
 
-pub async fn run(action: &HookAction, payload: &Payload) -> CommandOutput {
+/// Run the action and report its output line by line as it arrives.
+/// Returns the exit code (`None` when killed by a signal or failed to start).
+pub async fn run(
+    action: &HookAction,
+    payload: &Payload,
+    on_output: impl Fn(HookOutput),
+) -> Option<i32> {
     let HookAction::Command { command, .. } = action;
     let command = expand(command, payload);
-    let output = Command::new("sh")
+    on_output(HookOutput::Started(command.clone()));
+    let child = Command::new("sh")
         .arg("-c")
         .arg(&command)
         .stdin(Stdio::null())
-        .output()
-        .await;
-    match output {
-        Ok(o) => CommandOutput {
-            command,
-            stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
-            status: o.status.code(),
-        },
-        Err(e) => CommandOutput {
-            command,
-            stdout: String::new(),
-            stderr: e.to_string(),
-            status: None,
-        },
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => {
+            on_output(HookOutput::Stderr(e.to_string()));
+            return None;
+        }
+    };
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    tokio::join!(
+        read_lines(stdout, |line| on_output(HookOutput::Stdout(line))),
+        read_lines(stderr, |line| on_output(HookOutput::Stderr(line))),
+    );
+    match child.wait().await {
+        Ok(status) => status.code(),
+        Err(e) => {
+            on_output(HookOutput::Stderr(e.to_string()));
+            None
+        }
+    }
+}
+
+/// Call `on_line` for each line (lossy UTF-8, without the line break) until EOF.
+async fn read_lines(reader: impl AsyncRead + Unpin, on_line: impl Fn(String)) {
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
+                on_line(line.trim_end_matches(['\n', '\r']).to_string());
+            }
+        }
     }
 }
 
@@ -227,20 +259,57 @@ mod tests {
         );
     }
 
+    fn command(command: &str) -> HookAction {
+        HookAction::Command {
+            status: vec![],
+            command: command.into(),
+        }
+    }
+
     #[tokio::test]
     async fn run_command() {
-        let out = run(
-            &HookAction::Command {
-                status: vec![],
-                command: "echo ${{ issue_number }}; echo err >&2; exit 2".into(),
-            },
+        let outputs = std::sync::Mutex::new(vec![]);
+        let status = run(
+            &command("echo ${{ issue_number }}; echo err >&2; printf 'a\\nb'; exit 2"),
             &payload(),
+            |o| outputs.lock().unwrap().push(o),
         )
         .await;
-        assert_eq!(out.command, "echo 3; echo err >&2; exit 2");
-        assert_eq!(out.stdout, "3\n");
-        assert_eq!(out.stderr, "err\n");
-        assert_eq!(out.status, Some(2));
+        assert_eq!(status, Some(2));
+        let outputs = outputs.into_inner().unwrap();
+        assert_eq!(
+            outputs[0],
+            HookOutput::Started("echo 3; echo err >&2; printf 'a\\nb'; exit 2".into())
+        );
+        let stdout: Vec<_> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                HookOutput::Stdout(line) => Some(line.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stdout, ["3", "a", "b"]);
+        assert!(outputs.contains(&HookOutput::Stderr("err".into())));
+    }
+
+    #[tokio::test]
+    async fn output_is_reported_before_exit() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            run(
+                &command("echo first; sleep 1; echo last"),
+                &payload(),
+                |o| {
+                    let _ = tx.send(o);
+                },
+            )
+            .await
+        });
+        assert!(matches!(rx.recv().await, Some(HookOutput::Started(_))));
+        let first = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert_eq!(first.unwrap(), Some(HookOutput::Stdout("first".into())));
+        assert!(!task.is_finished());
+        assert_eq!(task.await.unwrap(), Some(0));
     }
 
     #[test]

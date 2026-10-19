@@ -10,7 +10,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::board::{self, Board};
 use crate::config::{Config, HookAction};
-use crate::hook::{self, CommandOutput, CommentTracker};
+use crate::hook::{self, CommentTracker, HookOutput};
 use crate::payload::Payload;
 
 /// `(lowercased repository, issue number)`
@@ -30,8 +30,10 @@ pub enum AppEvent {
     Status(String),
     /// Payload received from WebSocket
     Received(Payload),
-    /// Hook action finished
-    HookDone(Option<IssueKey>, CommandOutput),
+    /// Output of a running hook action (log tag, output)
+    HookOutput(String, HookOutput),
+    /// Hook action finished (issue, log tag, exit code)
+    HookDone(Option<IssueKey>, String, Option<i32>),
     /// Hook actions were not run (issue, count of actions, reason)
     HookSkipped(Option<IssueKey>, usize, String),
     Board(Result<Board, String>),
@@ -62,7 +64,8 @@ pub enum Focus {
 pub struct App {
     config: Config,
     tx: UnboundedSender<AppEvent>,
-    hook_tx: UnboundedSender<HookJob>,
+    /// Hook worker per issue (`None` for events without issue number)
+    hook_workers: HashMap<Option<IssueKey>, UnboundedSender<HookJob>>,
 
     pub board: Option<Board>,
     pub board_error: Option<String>,
@@ -91,11 +94,10 @@ type HookJob = (Payload, Vec<HookAction>);
 
 impl App {
     pub fn new(config: Config, tx: UnboundedSender<AppEvent>) -> Self {
-        let hook_tx = spawn_hook_worker(tx.clone());
         Self {
             config,
             tx,
-            hook_tx,
+            hook_workers: HashMap::new(),
             board: None,
             board_error: None,
             loading: false,
@@ -134,7 +136,12 @@ impl App {
             AppEvent::Redraw => {}
             AppEvent::Status(status) => self.status = status,
             AppEvent::Received(payload) => self.on_received(payload),
-            AppEvent::HookDone(issue, output) => self.on_hook_done(issue, output),
+            AppEvent::HookOutput(tag, output) => self.on_hook_output(&tag, output),
+            AppEvent::HookDone(issue, tag, status) => {
+                self.finish_actions(issue.as_ref(), 1);
+                let status = status.map_or("killed".to_string(), |c| c.to_string());
+                self.push(LogKind::Exit, format!("  [{tag}] exit {status}"));
+            }
             AppEvent::HookSkipped(issue, count, reason) => {
                 self.finish_actions(issue.as_ref(), count);
                 self.push(LogKind::Skipped, format!("  skipped: {reason}"));
@@ -264,30 +271,29 @@ impl App {
             .cloned()
             .collect();
         if !actions.is_empty() {
-            if let Some(n) = payload.issue_number {
-                *self
-                    .active_issues
-                    .entry(issue_key(&payload.repository, n))
-                    .or_default() += actions.len();
+            let key = payload
+                .issue_number
+                .map(|n| issue_key(&payload.repository, n));
+            if let Some(key) = &key {
+                *self.active_issues.entry(key.clone()).or_default() += actions.len();
             }
-            let _ = self.hook_tx.send((payload, actions));
+            let tx = &self.tx;
+            let _ = self
+                .hook_workers
+                .entry(key)
+                .or_insert_with(|| spawn_hook_worker(tx.clone()))
+                .send((payload, actions));
         }
         self.refresh_board();
     }
 
-    fn on_hook_done(&mut self, issue: Option<IssueKey>, output: CommandOutput) {
-        self.finish_actions(issue.as_ref(), 1);
-        self.push(LogKind::Command, format!("  $ {}", output.command));
-        for line in output.stdout.lines() {
-            self.push(LogKind::Stdout, format!("    {line}"));
-        }
-        for line in output.stderr.lines() {
-            self.push(LogKind::Stderr, format!("    {line}"));
-        }
-        let status = output
-            .status
-            .map_or("killed".to_string(), |c| c.to_string());
-        self.push(LogKind::Exit, format!("    exit {status}"));
+    fn on_hook_output(&mut self, tag: &str, output: HookOutput) {
+        let (kind, text) = match output {
+            HookOutput::Started(command) => (LogKind::Command, format!("$ {command}")),
+            HookOutput::Stdout(line) => (LogKind::Stdout, format!("  {line}")),
+            HookOutput::Stderr(line) => (LogKind::Stderr, format!("  {line}")),
+        };
+        self.push(kind, format!("  [{tag}] {text}"));
     }
 
     fn finish_actions(&mut self, issue: Option<&IssueKey>, count: usize) {
@@ -306,7 +312,8 @@ impl App {
     }
 }
 
-/// Run hook actions sequentially so that outputs keep the order of events.
+/// Run hook actions of one issue sequentially so that the comment check and
+/// actions keep the order of events. Workers of different issues run concurrently.
 ///
 /// For issue events, actions run only when the last comment of the issue
 /// changed since the previous check (or it is the first check), and only
@@ -319,6 +326,10 @@ fn spawn_hook_worker(tx: UnboundedSender<AppEvent>) -> UnboundedSender<HookJob> 
             let issue = payload
                 .issue_number
                 .map(|n| issue_key(&payload.repository, n));
+            let tag = match payload.issue_number {
+                Some(n) => format!("#{n}"),
+                None => payload.hook_type(),
+            };
             let label = match payload.issue_number {
                 Some(n) => format!("{} #{n}", payload.hook_type()),
                 None => payload.hook_type(),
@@ -349,7 +360,11 @@ fn spawn_hook_worker(tx: UnboundedSender<AppEvent>) -> UnboundedSender<HookJob> 
 
             for action in &actions {
                 let event = if action.accepts(&statuses) {
-                    AppEvent::HookDone(issue.clone(), hook::run(action, &payload).await)
+                    let status = hook::run(action, &payload, |output| {
+                        let _ = tx.send(AppEvent::HookOutput(tag.clone(), output));
+                    })
+                    .await;
+                    AppEvent::HookDone(issue.clone(), tag.clone(), status)
                 } else {
                     skip(1, status_mismatch(action, &statuses))
                 };
@@ -378,15 +393,6 @@ fn status_mismatch(action: &HookAction, statuses: &[String]) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn output() -> CommandOutput {
-        CommandOutput {
-            command: "true".into(),
-            stdout: String::new(),
-            stderr: String::new(),
-            status: Some(0),
-        }
-    }
 
     fn payload(repository: &str, event_name: &str) -> Payload {
         Payload::from_value(json!({
@@ -422,9 +428,9 @@ mod tests {
 
         app.handle(AppEvent::Received(payload("Owner/Repo", "issues")));
         assert_eq!(app.active_issues.get(&key), Some(&2));
-        app.handle(AppEvent::HookDone(Some(key.clone()), output()));
+        app.handle(AppEvent::HookDone(Some(key.clone()), "#3".into(), Some(0)));
         assert_eq!(app.active_issues.get(&key), Some(&1));
-        app.handle(AppEvent::HookDone(Some(key.clone()), output()));
+        app.handle(AppEvent::HookDone(Some(key.clone()), "#3".into(), Some(0)));
         assert!(app.active_issues.is_empty());
 
         // skipped actions also clear the mark
