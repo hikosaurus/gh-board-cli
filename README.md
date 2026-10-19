@@ -9,12 +9,12 @@ mise install
 cargo build --release
 ```
 
-[gh](https://cli.github.com/) にログイン済みであること（Project の取得に `gh api graphql` を使用します）。
+[gh](https://cli.github.com/) にログイン済みであること（`gh project list` / `gh api graphql` / `gh issue view` を使用します）。Project の取得には `read:project` スコープが必要です（`gh auth refresh -s read:project`）。
 
 ## Usage
 
 ```sh
-gh-board-cli "<owner>/<repo>"
+gh-board-cli
 ```
 
 | Key | 動作 |
@@ -27,7 +27,7 @@ gh-board-cli "<owner>/<repo>"
 | クリック (`#n ...`) | Issue をブラウザで開く (`gh issue view --web`) |
 | ホイール | カーソル下のペインをスクロール |
 
-- 左ペインは Project の Status ごとに Issue を表示します（Done は更新日時が新しい順に最大10件）
+- 左ペインは `gh project list` で取得した開いている Project ごとに、Status 別の Issue を表示します（Done は更新日時が新しい順に最大10件）
 - 🟢 はその Issue のイベントに一致した Hook を実行中であることを示します
 - マウス入力を有効にしているため、ターミナルでの文字選択は Shift (iTerm2 / Terminal.app では Option) を押しながら行ってください
 
@@ -39,6 +39,7 @@ gh-board-cli "<owner>/<repo>"
 {
   "listen": "wss://ws-{cluster}.pusher.com/app/{app_key}?protocol=7&client=rust&version=1.0.0",
   "channel": "gh-board",
+  "targets": ["owner/repo01", "owner/repo02"],
   "hooks": {
     "issues:*": [
       { "type": "command", "command": "echo ${{ issue_number }}" }
@@ -52,6 +53,7 @@ gh-board-cli "<owner>/<repo>"
 
 - `listen`: 購読する WebSocket の URL
 - `channel` (任意): Pusher のチャンネル名。指定時は接続後に `pusher:subscribe` を送信します
+- `targets` (任意): Hook の対象リポジトリ。空・未指定なら全リポジトリが対象です
 - `hooks`: HookType → HookAction の配列
   - HookType: `{event_name}:{event_action}`。`*` は任意の文字列に一致します
   - HookAction: `{ "type": "command", "command": "..." }` を `sh -c` で実行します
@@ -83,7 +85,15 @@ gh-board-cli "<owner>/<repo>"
 - `event_action`: `github.event.action` の内容（省略時は空文字）
 - `issue_number`: Issue 番号（数値または数字の文字列）。🟢 の表示に使います
 
-Pusher の envelope（`{"event": "...", "data": "<payload の JSON 文字列>"}`）で届いた場合は `data` を展開します。`repository` が引数と一致しないイベントは Hook を実行しません。
+Pusher の envelope（`{"event": "...", "data": "<payload の JSON 文字列>"}`）で届いた場合は `data` を展開します。
+
+### Hook の実行条件
+
+1. `targets` が空、または `repository` が `targets` に含まれる
+2. HookType `{event_name}:{event_action}` が一致する
+3. `issue_number` がある場合、`gh issue view <issue_number> -R <repository> --json comments --jq '.comments[-1]'` で取得した最新コメントの `(id, body)` が前回の取得値と異なる（初回は実行）
+   - 前回値はリポジトリ + Issue 番号ごとに保持します（起動中のみ）
+   - `gh` の実行に失敗した場合は Hook を実行しません
 
 ## 開発
 
