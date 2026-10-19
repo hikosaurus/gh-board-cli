@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-pub const CONFIG_FILE_NAME: &str = ".ghboard.json";
+/// Config file names in lookup order.
+pub const CONFIG_FILE_NAMES: [&str; 2] = [".ghboard.yaml", ".ghboard.yml"];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -53,7 +54,7 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        Ok(serde_json::from_str(text)?)
+        Ok(serde_yaml_ng::from_str(text)?)
     }
 
     pub fn is_target(&self, repository: &str) -> bool {
@@ -64,14 +65,15 @@ impl Config {
                 .any(|t| t.eq_ignore_ascii_case(repository))
     }
 
-    /// `.ghboard.json` in the current directory, falling back to the home directory.
+    /// `.ghboard.yaml` (or `.ghboard.yml`) in the current directory,
+    /// falling back to the home directory.
     pub fn find() -> Option<PathBuf> {
-        let local = PathBuf::from(CONFIG_FILE_NAME);
-        if local.is_file() {
-            return Some(local);
-        }
-        let home = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(CONFIG_FILE_NAME))?;
-        home.is_file().then_some(home)
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        [Some(PathBuf::new()), home]
+            .into_iter()
+            .flatten()
+            .flat_map(|dir| CONFIG_FILE_NAMES.map(|name| dir.join(name)))
+            .find(|path| path.is_file())
     }
 }
 
@@ -82,14 +84,13 @@ mod tests {
     #[test]
     fn parse_example_config() {
         let config = Config::parse(
-            r#"{
-                "listen": "wss://example.com/app/key",
-                "hooks": {
-                    "issues:*": [
-                        { "type": "command", "command": "echo ${{ event.issue.id }}" }
-                    ]
-                }
-            }"#,
+            r#"
+listen: wss://example.com/app/key
+hooks:
+  issues:*:
+    - type: command
+      command: echo ${{ event.issue.id }}
+"#,
         )
         .unwrap();
         assert_eq!(config.listen, "wss://example.com/app/key");
@@ -106,15 +107,16 @@ mod tests {
     #[test]
     fn action_status() {
         let config = Config::parse(
-            r#"{
-                "listen": "ws://x",
-                "hooks": {
-                    "issues:*": [
-                        { "type": "command", "status": ["In Progress", "In Review"], "command": "a" },
-                        { "type": "command", "status": [], "command": "b" }
-                    ]
-                }
-            }"#,
+            r#"
+listen: ws://x
+hooks:
+  issues:*:
+    - type: command
+      status: [In Progress, In Review]
+      command: a
+    - type: command
+      command: b
+"#,
         )
         .unwrap();
         let [some, any] = &config.hooks["issues:*"][..] else {
@@ -132,11 +134,21 @@ mod tests {
 
     #[test]
     fn targets() {
-        let all = Config::parse(r#"{ "listen": "ws://x" }"#).unwrap();
+        let all = Config::parse("listen: ws://x").unwrap();
         assert!(all.is_target("any/repo"));
 
-        let some = Config::parse(r#"{ "listen": "ws://x", "targets": ["Owner/Repo01"] }"#).unwrap();
+        let some = Config::parse("listen: ws://x\ntargets:\n  - Owner/Repo01").unwrap();
         assert!(some.is_target("owner/repo01"));
         assert!(!some.is_target("owner/repo02"));
+    }
+
+    #[test]
+    fn parse_json_style() {
+        // YAML is a superset of JSON, so the former JSON config still parses.
+        let config = Config::parse(
+            r#"{ "listen": "ws://x", "hooks": { "issues:*": [{ "type": "command", "command": "a" }] } }"#,
+        )
+        .unwrap();
+        assert_eq!(config.hooks["issues:*"].len(), 1);
     }
 }
