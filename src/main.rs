@@ -59,6 +59,13 @@ async fn main() -> Result<()> {
                 break;
             };
             app.handle(event);
+            // Handle queued events (e.g. bursts of hook output) before redrawing
+            // so that drawing does not delay key input.
+            while !app.quit
+                && let Ok(event) = rx.try_recv()
+            {
+                app.handle(event);
+            }
         }
         Ok::<_, anyhow::Error>(())
     }
