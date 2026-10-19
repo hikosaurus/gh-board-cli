@@ -25,6 +25,9 @@ async fn main() -> Result<()> {
         Config::find().with_context(|| format!("{} not found", CONFIG_FILE_NAMES.join(" or ")))?;
     let config = Config::load(&path)?;
 
+    // Select the TLS crypto provider for `wss://` explicitly.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     tokio::spawn(listener::listen(
