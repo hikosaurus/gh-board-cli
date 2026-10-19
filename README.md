@@ -42,7 +42,7 @@ gh-board-cli
   "targets": ["owner/repo01", "owner/repo02"],
   "hooks": {
     "issues:*": [
-      { "type": "command", "command": "echo ${{ issue_number }}" }
+      { "type": "command", "status": ["In Progress", "In Review"], "command": "echo ${{ issue_number }}" }
     ],
     "issue_comment:created": [
       { "type": "command", "command": "echo ${{ event_name }}:${{ event_action }} #${{ issue_number }}" }
@@ -56,7 +56,9 @@ gh-board-cli
 - `targets` (任意): Hook の対象リポジトリ。空・未指定なら全リポジトリが対象です
 - `hooks`: HookType → HookAction の配列
   - HookType: `{event_name}:{event_action}`。`*` は任意の文字列に一致します
-  - HookAction: `{ "type": "command", "command": "..." }` を `sh -c` で実行します
+  - HookAction: `{ "type": "command", "status": [...], "command": "..." }`
+    - `command`: `sh -c` で実行するコマンド
+    - `status` (任意): 実行対象とする Issue の Project ステータス。空・未指定ならステータスに関係なく実行します
 
 ### 組み込み変数
 
@@ -91,9 +93,15 @@ Pusher の envelope（`{"event": "...", "data": "<payload の JSON 文字列>"}`
 
 1. `targets` が空、または `repository` が `targets` に含まれる
 2. HookType `{event_name}:{event_action}` が一致する
-3. `issue_number` がある場合、`gh issue view <issue_number> -R <repository> --json comments --jq '.comments[-1]'` で取得した最新コメントの `(id, body)` が前回の取得値と異なる（初回は実行）
+3. `issue_number` がある場合、`gh issue view <issue_number> -R <repository> --json comments,projectItems` で取得した最新コメントの `(id, body)` が前回の取得値と異なる（初回は実行）
    - 前回値はリポジトリ + Issue 番号ごとに保持します（起動中のみ）
    - `gh` の実行に失敗した場合は Hook を実行しません
+4. HookAction の `status` が空・未指定、または Issue の Project ステータスが `status` に含まれる（HookAction ごとに判定）
+   - Issue が複数の Project に入っている場合は、いずれかのステータスが含まれれば実行します
+   - ステータス名は大文字・小文字を区別して比較します
+   - `issue_number` がないイベントでは、`status` を指定した HookAction は実行しません
+
+実行しなかった HookAction は、右ペインに `skipped: <HookType> #n: <理由>` と表示します。
 
 ## 開発
 
