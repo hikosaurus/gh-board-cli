@@ -1,30 +1,41 @@
-use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Event payload delivered over WebSocket.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+///
+/// `{"repository": "owner/repo", "event_name": "...", "event_action": "...", "issue_number": 1}`
+#[derive(Debug, Clone, PartialEq)]
 pub struct Payload {
     pub repository: String,
     pub event_name: String,
-    #[serde(default)]
-    pub event: Value,
+    pub event_action: String,
+    pub issue_number: Option<u64>,
+    /// All fields of the payload (used as built-in variables)
+    pub fields: Map<String, Value>,
 }
 
 impl Payload {
-    pub fn action(&self) -> &str {
-        self.event
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("")
+    pub fn from_value(value: Value) -> Option<Self> {
+        let Value::Object(fields) = value else {
+            return None;
+        };
+        let string = |key: &str| fields.get(key).and_then(Value::as_str).map(str::to_string);
+        let issue_number = match fields.get("issue_number") {
+            Some(Value::Number(n)) => n.as_u64(),
+            Some(Value::String(s)) => s.parse().ok(),
+            _ => None,
+        };
+        Some(Self {
+            repository: string("repository")?,
+            event_name: string("event_name")?,
+            event_action: string("event_action").unwrap_or_default(),
+            issue_number,
+            fields,
+        })
     }
 
-    /// HookType: `{event_name}:{event.action}`
+    /// HookType: `{event_name}:{event_action}`
     pub fn hook_type(&self) -> String {
-        format!("{}:{}", self.event_name, self.action())
-    }
-
-    pub fn issue_number(&self) -> Option<u64> {
-        self.event.pointer("/issue/number").and_then(Value::as_u64)
+        format!("{}:{}", self.event_name, self.event_action)
     }
 }
 
@@ -46,7 +57,7 @@ pub fn parse_message(text: &str) -> Message {
         return Message::Unknown(text.to_string());
     };
 
-    if let Ok(payload) = serde_json::from_value::<Payload>(value.clone()) {
+    if let Some(payload) = Payload::from_value(value.clone()) {
         return Message::Payload(payload);
     }
 
@@ -65,7 +76,7 @@ pub fn parse_message(text: &str) -> Message {
             Some(v) => Some(v.clone()),
             None => None,
         };
-        if let Some(payload) = data.and_then(|d| serde_json::from_value::<Payload>(d).ok()) {
+        if let Some(payload) = data.and_then(Payload::from_value) {
             return Message::Payload(payload);
         }
     }
@@ -83,7 +94,8 @@ mod tests {
         let text = json!({
             "repository": "owner/repo",
             "event_name": "issues",
-            "event": { "action": "opened", "issue": { "number": 3 } }
+            "event_action": "opened",
+            "issue_number": 3
         })
         .to_string();
         let Message::Payload(p) = parse_message(&text) else {
@@ -91,7 +103,7 @@ mod tests {
         };
         assert_eq!(p.repository, "owner/repo");
         assert_eq!(p.hook_type(), "issues:opened");
-        assert_eq!(p.issue_number(), Some(3));
+        assert_eq!(p.issue_number, Some(3));
     }
 
     #[test]
@@ -99,7 +111,8 @@ mod tests {
         let inner = json!({
             "repository": "owner/repo",
             "event_name": "issue_comment",
-            "event": { "action": "created" }
+            "event_action": "created",
+            "issue_number": "5"
         });
         let text = json!({
             "event": "github",
@@ -111,6 +124,7 @@ mod tests {
             panic!("not payload");
         };
         assert_eq!(p.hook_type(), "issue_comment:created");
+        assert_eq!(p.issue_number, Some(5));
     }
 
     #[test]
@@ -126,12 +140,16 @@ mod tests {
     }
 
     #[test]
-    fn hook_type_without_action() {
-        let p = Payload {
-            repository: "o/r".into(),
-            event_name: "push".into(),
-            event: json!({}),
-        };
+    fn payload_without_optional_fields() {
+        let p = Payload::from_value(json!({ "repository": "o/r", "event_name": "push" })).unwrap();
         assert_eq!(p.hook_type(), "push:");
+        assert_eq!(p.issue_number, None);
+    }
+
+    #[test]
+    fn reject_payload_without_required_fields() {
+        assert_eq!(Payload::from_value(json!({ "event_name": "push" })), None);
+        assert_eq!(Payload::from_value(json!({ "repository": "o/r" })), None);
+        assert_eq!(Payload::from_value(json!([])), None);
     }
 }

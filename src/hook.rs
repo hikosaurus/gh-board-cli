@@ -35,7 +35,7 @@ pub fn select<'a>(config: &'a Config, payload: &Payload) -> Vec<&'a HookAction> 
         .collect()
 }
 
-/// Replace `${{ name.path.to.value }}` with built-in variables.
+/// Replace `${{ name }}` (or `${{ name.path.to.value }}`) with payload fields.
 pub fn expand(template: &str, payload: &Payload) -> String {
     VARIABLE
         .replace_all(template, |caps: &Captures| {
@@ -46,11 +46,7 @@ pub fn expand(template: &str, payload: &Payload) -> String {
 
 fn lookup(path: &str, payload: &Payload) -> Option<String> {
     let mut keys = path.split('.');
-    let root = match keys.next()? {
-        "event_name" => Value::String(payload.event_name.clone()),
-        "event" => payload.event.clone(),
-        _ => return None,
-    };
+    let root = payload.fields.get(keys.next()?)?.clone();
     let value = keys.try_fold(root, |v, key| match v {
         Value::Object(mut map) => map.remove(key),
         Value::Array(mut arr) => {
@@ -104,14 +100,14 @@ mod tests {
     use serde_json::json;
 
     fn payload() -> Payload {
-        Payload {
-            repository: "owner/repo".into(),
-            event_name: "issues".into(),
-            event: json!({
-                "action": "opened",
-                "issue": { "id": 123, "number": 3, "title": "hello", "labels": [{ "name": "bug" }] }
-            }),
-        }
+        Payload::from_value(json!({
+            "repository": "owner/repo",
+            "event_name": "issues",
+            "event_action": "opened",
+            "issue_number": 3,
+            "issue": { "title": "hello", "labels": [{ "name": "bug" }] }
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -128,18 +124,17 @@ mod tests {
     #[test]
     fn expand_variables() {
         let p = payload();
-        assert_eq!(expand("echo ${{ event.issue.id }}", &p), "echo 123");
+        assert_eq!(expand("echo ${{ issue_number }}", &p), "echo 3");
         assert_eq!(
-            expand("${{event_name}}:${{ event.action }}", &p),
+            expand("${{event_name}}:${{ event_action }}", &p),
             "issues:opened"
         );
-        assert_eq!(expand("${{ event.issue.title }}", &p), "hello");
-        assert_eq!(expand("${{ event.issue.labels.0.name }}", &p), "bug");
-        assert_eq!(expand("[${{ event.nothing }}]", &p), "[]");
-        assert_eq!(
-            expand("${{ event.issue.labels }}", &p),
-            r#"[{"name":"bug"}]"#
-        );
+        assert_eq!(expand("${{ repository }}", &p), "owner/repo");
+        // extra fields and nested values
+        assert_eq!(expand("${{ issue.title }}", &p), "hello");
+        assert_eq!(expand("${{ issue.labels.0.name }}", &p), "bug");
+        assert_eq!(expand("${{ issue.labels }}", &p), r#"[{"name":"bug"}]"#);
+        assert_eq!(expand("[${{ nothing }}]", &p), "[]");
     }
 
     #[test]
@@ -168,7 +163,7 @@ mod tests {
     async fn run_command() {
         let out = run(
             &HookAction::Command {
-                command: "echo ${{ event.issue.number }}; echo err >&2; exit 2".into(),
+                command: "echo ${{ issue_number }}; echo err >&2; exit 2".into(),
             },
             &payload(),
         )

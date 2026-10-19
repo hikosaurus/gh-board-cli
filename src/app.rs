@@ -232,7 +232,7 @@ impl App {
     fn on_received(&mut self, payload: Payload) {
         let hook_type = payload.hook_type();
         let issue = payload
-            .issue_number()
+            .issue_number
             .map(|n| format!("#{n} "))
             .unwrap_or_default();
 
@@ -251,7 +251,7 @@ impl App {
             .cloned()
             .collect();
         if !actions.is_empty() {
-            if let Some(n) = payload.issue_number() {
+            if let Some(n) = payload.issue_number {
                 *self.active_issues.entry(n).or_default() += actions.len();
             }
             let _ = self.hook_tx.send((payload, actions));
@@ -293,7 +293,7 @@ fn spawn_hook_worker(tx: UnboundedSender<AppEvent>) -> UnboundedSender<HookJob> 
         while let Some((payload, actions)) = hook_rx.recv().await {
             for action in &actions {
                 let output = hook::run(action, &payload).await;
-                let done = AppEvent::HookDone(payload.issue_number(), output);
+                let done = AppEvent::HookDone(payload.issue_number, output);
                 if tx.send(done).is_err() {
                     return;
                 }
@@ -334,10 +334,14 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new("owner/repo".into(), config, tx);
 
-        let payload = |event_name: &str| Payload {
-            repository: "owner/repo".into(),
-            event_name: event_name.into(),
-            event: json!({ "action": "opened", "issue": { "number": 3 } }),
+        let payload = |event_name: &str| {
+            Payload::from_value(json!({
+                "repository": "owner/repo",
+                "event_name": event_name,
+                "event_action": "opened",
+                "issue_number": 3
+            }))
+            .unwrap()
         };
 
         // no matching hook -> not marked
