@@ -14,11 +14,13 @@ use tokio::sync::mpsc;
 use crate::app::{App, AppEvent};
 use crate::config::{CONFIG_FILE_NAME, Config};
 
-const USAGE: &str = "usage: gh-board-cli <owner>/<repo>";
+const USAGE: &str = "usage: gh-board-cli";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let repository = parse_args()?;
+    if std::env::args().len() > 1 {
+        bail!(USAGE);
+    }
     let path = Config::find().with_context(|| format!("{CONFIG_FILE_NAME} not found"))?;
     let config = Config::load(&path)?;
 
@@ -44,7 +46,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let mut app = App::new(repository, config, tx);
+    let mut app = App::new(config, tx);
     app.refresh_board();
 
     let mut terminal = ratatui::init();
@@ -63,17 +65,4 @@ async fn main() -> Result<()> {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
-}
-
-fn parse_args() -> Result<String> {
-    let mut args = std::env::args().skip(1);
-    let (Some(repository), None) = (args.next(), args.next()) else {
-        bail!(USAGE);
-    };
-    match repository.split_once('/') {
-        Some((owner, repo)) if !owner.is_empty() && !repo.is_empty() && !repo.contains('/') => {
-            Ok(repository)
-        }
-        _ => bail!(USAGE),
-    }
 }

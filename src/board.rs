@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use futures_util::future::try_join_all;
 use serde_json::Value;
 use tokio::process::Command;
 
@@ -8,24 +9,20 @@ const DONE: &str = "Done";
 const DONE_LIMIT: usize = 10;
 
 const QUERY: &str = r#"
-query($owner: String!, $repo: String!, $after: String) {
-  repository(owner: $owner, name: $repo) {
-    projectsV2(first: 1) {
-      nodes {
-        title
-        owner { ... on User { login } ... on Organization { login } }
-        field(name: "Status") {
-          ... on ProjectV2SingleSelectField { options { name } }
-        }
-        items(first: 100, after: $after) {
-          pageInfo { hasNextPage endCursor }
-          nodes {
-            fieldValueByName(name: "Status") {
-              ... on ProjectV2ItemFieldSingleSelectValue { name }
-            }
-            content {
-              ... on Issue { number title updatedAt repository { nameWithOwner } }
-            }
+query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on ProjectV2 {
+      field(name: "Status") {
+        ... on ProjectV2SingleSelectField { options { name } }
+      }
+      items(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          fieldValueByName(name: "Status") {
+            ... on ProjectV2ItemFieldSingleSelectValue { name }
+          }
+          content {
+            ... on Issue { number title updatedAt repository { nameWithOwner } }
           }
         }
       }
@@ -36,6 +33,8 @@ query($owner: String!, $repo: String!, $after: String) {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Issue {
+    /// `{owner}/{repo}`
+    pub repository: String,
     pub number: u64,
     pub title: String,
     /// ISO 8601 (sortable as string)
@@ -49,72 +48,90 @@ pub struct Column {
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Board {
+pub struct Project {
+    pub id: String,
     pub owner: String,
     pub title: String,
     pub columns: Vec<Column>,
 }
 
-/// Fetch the first GitHub Project linked to the repository via `gh api graphql`.
-pub async fn fetch(repository: &str) -> Result<Board> {
-    let (owner, repo) = repository
-        .split_once('/')
-        .context("repository must be <owner>/<repo>")?;
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Board {
+    pub projects: Vec<Project>,
+}
 
-    let mut board: Option<Board> = None;
+/// Fetch open projects (`gh project list`) and their issues (`gh api graphql`).
+pub async fn fetch() -> Result<Board> {
+    let list = gh(&["project", "list", "--format", "json", "--limit", "100"]).await?;
+    let projects = parse_projects(&list);
+    let projects = try_join_all(projects.into_iter().map(fetch_items)).await?;
+    Ok(Board { projects })
+}
+
+/// Open projects in `gh project list --format json`.
+fn parse_projects(list: &Value) -> Vec<Project> {
+    list["projects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["closed"].as_bool() == Some(false))
+        .map(|p| Project {
+            id: p["id"].as_str().unwrap_or_default().to_string(),
+            owner: p["owner"]["login"].as_str().unwrap_or_default().to_string(),
+            title: p["title"].as_str().unwrap_or_default().to_string(),
+            columns: vec![],
+        })
+        .collect()
+}
+
+async fn fetch_items(mut project: Project) -> Result<Project> {
     let mut after: Option<String> = None;
     loop {
-        let page = query(owner, repo, after.as_deref()).await?;
-        let project = page
-            .pointer("/data/repository/projectsV2/nodes/0")
-            .context("no GitHub Project is linked to the repository")?;
-        let board = board.get_or_insert_with(|| new_board(project));
-        add_items(board, repository, project);
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".into(),
+            "-f".into(),
+            format!("query={QUERY}"),
+            "-F".into(),
+            format!("id={}", project.id),
+        ];
+        if let Some(after) = &after {
+            args.extend(["-F".into(), format!("after={after}")]);
+        }
+        let page = gh(&args).await?;
+        let node = &page["data"]["node"];
+        if project.columns.is_empty() {
+            project.columns = new_columns(node);
+        }
+        add_items(&mut project, node);
 
-        let page_info = &project["items"]["pageInfo"];
+        let page_info = &node["items"]["pageInfo"];
         if page_info["hasNextPage"].as_bool() != Some(true) {
             break;
         }
         after = page_info["endCursor"].as_str().map(str::to_string);
     }
-    let mut board = board.unwrap_or_default();
-    board
+    project
         .columns
         .retain(|c| c.name != NO_STATUS || !c.issues.is_empty());
-    limit_done(&mut board);
-    Ok(board)
+    limit_done(&mut project);
+    Ok(project)
 }
 
-fn limit_done(board: &mut Board) {
-    for column in board.columns.iter_mut().filter(|c| c.name == DONE) {
-        column
-            .issues
-            .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        column.issues.truncate(DONE_LIMIT);
-    }
-}
-
-async fn query(owner: &str, repo: &str, after: Option<&str>) -> Result<Value> {
-    let mut cmd = Command::new("gh");
-    cmd.args(["api", "graphql"])
-        .args(["-f", &format!("query={QUERY}")])
-        .args(["-F", &format!("owner={owner}")])
-        .args(["-F", &format!("repo={repo}")]);
-    if let Some(after) = after {
-        cmd.args(["-F", &format!("after={after}")]);
-    }
-    let output = cmd.output().await.context("failed to run gh")?;
+async fn gh<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Result<Value> {
+    let output = Command::new("gh")
+        .args(args)
+        .output()
+        .await
+        .context("failed to run gh")?;
     if !output.status.success() {
-        bail!(
-            "gh api graphql: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("gh: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-fn new_board(project: &Value) -> Board {
-    let mut columns: Vec<Column> = project["field"]["options"]
+fn new_columns(node: &Value) -> Vec<Column> {
+    let mut columns: Vec<Column> = node["field"]["options"]
         .as_array()
         .into_iter()
         .flatten()
@@ -128,45 +145,35 @@ fn new_board(project: &Value) -> Board {
         name: NO_STATUS.to_string(),
         issues: vec![],
     });
-    Board {
-        owner: project["owner"]["login"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
-        title: project["title"].as_str().unwrap_or_default().to_string(),
-        columns,
-    }
+    columns
 }
 
-fn add_items(board: &mut Board, repository: &str, project: &Value) {
-    let items = project["items"]["nodes"].as_array().into_iter().flatten();
+fn add_items(project: &mut Project, node: &Value) {
+    let items = node["items"]["nodes"].as_array().into_iter().flatten();
     for item in items {
         let content = &item["content"];
         let (Some(number), Some(title)) = (content["number"].as_u64(), content["title"].as_str())
         else {
             continue; // not an issue (draft / pull request)
         };
-        // Project may contain issues from other repositories
-        if content["repository"]["nameWithOwner"]
-            .as_str()
-            .is_some_and(|r| !r.eq_ignore_ascii_case(repository))
-        {
-            continue;
-        }
         let status = item["fieldValueByName"]["name"]
             .as_str()
             .unwrap_or(NO_STATUS);
-        let column = match board.columns.iter().position(|c| c.name == status) {
-            Some(i) => &mut board.columns[i],
+        let column = match project.columns.iter().position(|c| c.name == status) {
+            Some(i) => &mut project.columns[i],
             None => {
-                board.columns.push(Column {
+                project.columns.push(Column {
                     name: status.to_string(),
                     issues: vec![],
                 });
-                board.columns.last_mut().unwrap()
+                project.columns.last_mut().unwrap()
             }
         };
         column.issues.push(Issue {
+            repository: content["repository"]["nameWithOwner"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             number,
             title: title.to_string(),
             updated_at: content["updatedAt"]
@@ -177,16 +184,43 @@ fn add_items(board: &mut Board, repository: &str, project: &Value) {
     }
 }
 
+fn limit_done(project: &mut Project) {
+    for column in project.columns.iter_mut().filter(|c| c.name == DONE) {
+        column
+            .issues
+            .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        column.issues.truncate(DONE_LIMIT);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     #[test]
-    fn build_board_from_response() {
-        let project = json!({
-            "title": "proj",
-            "owner": { "login": "owner" },
+    fn parse_open_projects() {
+        let list = json!({ "projects": [
+            { "closed": false, "id": "P1", "title": "a", "owner": { "login": "me" } },
+            { "closed": true, "id": "P2", "title": "b", "owner": { "login": "me" } },
+            { "closed": false, "id": "P3", "title": "c", "owner": { "login": "org" } }
+        ] });
+        let projects: Vec<_> = parse_projects(&list)
+            .into_iter()
+            .map(|p| (p.id, p.owner, p.title))
+            .collect();
+        assert_eq!(
+            projects,
+            vec![
+                ("P1".into(), "me".into(), "a".into()),
+                ("P3".into(), "org".into(), "c".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn build_columns_from_response() {
+        let node = json!({
             "field": { "options": [{ "name": "Todo" }, { "name": "In Progress" }] },
             "items": { "nodes": [
                 { "fieldValueByName": { "name": "In Progress" },
@@ -198,26 +232,30 @@ mod tests {
                 { "fieldValueByName": { "name": "Todo" }, "content": {} }
             ] }
         });
-        let mut board = new_board(&project);
-        add_items(&mut board, "owner/repo", &project);
-        assert_eq!(board.owner, "owner");
-        assert_eq!(board.title, "proj");
-        let summary: Vec<_> = board
+        let mut project = Project {
+            columns: new_columns(&node),
+            ..Default::default()
+        };
+        add_items(&mut project, &node);
+        let summary: Vec<_> = project
             .columns
             .iter()
             .map(|c| {
                 (
                     c.name.as_str(),
-                    c.issues.iter().map(|i| i.number).collect::<Vec<_>>(),
+                    c.issues
+                        .iter()
+                        .map(|i| (i.repository.as_str(), i.number))
+                        .collect::<Vec<_>>(),
                 )
             })
             .collect();
         assert_eq!(
             summary,
             vec![
-                ("Todo", vec![]),
-                ("In Progress", vec![3]),
-                (NO_STATUS, vec![4])
+                ("Todo", vec![("other/repo", 9)]),
+                ("In Progress", vec![("owner/repo", 3)]),
+                (NO_STATUS, vec![("owner/repo", 4)])
             ]
         );
     }
@@ -226,12 +264,13 @@ mod tests {
     fn limit_done_to_recent_issues() {
         let issues = (1..=12)
             .map(|n| Issue {
+                repository: "o/r".into(),
                 number: n,
                 title: format!("i{n}"),
                 updated_at: format!("2026-10-{n:02}T00:00:00Z"),
             })
             .collect::<Vec<_>>();
-        let mut board = Board {
+        let mut project = Project {
             columns: vec![
                 Column {
                     name: "Todo".into(),
@@ -244,9 +283,9 @@ mod tests {
             ],
             ..Default::default()
         };
-        limit_done(&mut board);
-        assert_eq!(board.columns[0].issues.len(), 12);
-        let done: Vec<_> = board.columns[1].issues.iter().map(|i| i.number).collect();
+        limit_done(&mut project);
+        assert_eq!(project.columns[0].issues.len(), 12);
+        let done: Vec<_> = project.columns[1].issues.iter().map(|i| i.number).collect();
         assert_eq!(done, (3..=12).rev().collect::<Vec<_>>());
     }
 }

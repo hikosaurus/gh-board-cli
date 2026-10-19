@@ -13,7 +13,10 @@ pub struct Config {
     /// Pusher channel to subscribe after connection (optional)
     #[serde(default)]
     pub channel: Option<String>,
-    /// HookType (`{event_name}:{event.action}`) -> HookActions
+    /// Repositories (`{owner}/{repo}`) to handle. Empty means all repositories.
+    #[serde(default)]
+    pub targets: Vec<String>,
+    /// HookType (`{event_name}:{event_action}`) -> HookActions
     #[serde(default)]
     pub hooks: BTreeMap<String, Vec<HookAction>>,
 }
@@ -33,6 +36,14 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Self> {
         Ok(serde_json::from_str(text)?)
+    }
+
+    pub fn is_target(&self, repository: &str) -> bool {
+        self.targets.is_empty()
+            || self
+                .targets
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(repository))
     }
 
     /// `.ghboard.json` in the current directory, falling back to the home directory.
@@ -71,5 +82,15 @@ mod tests {
                 command: "echo ${{ event.issue.id }}".into()
             }]
         );
+    }
+
+    #[test]
+    fn targets() {
+        let all = Config::parse(r#"{ "listen": "ws://x" }"#).unwrap();
+        assert!(all.is_target("any/repo"));
+
+        let some = Config::parse(r#"{ "listen": "ws://x", "targets": ["Owner/Repo01"] }"#).unwrap();
+        assert!(some.is_target("owner/repo01"));
+        assert!(!some.is_target("owner/repo02"));
     }
 }

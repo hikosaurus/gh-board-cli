@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::LazyLock;
 
@@ -59,6 +60,53 @@ fn lookup(path: &str, payload: &Payload) -> Option<String> {
         Value::String(s) => s,
         v => v.to_string(),
     })
+}
+
+/// Last issue comment `(id, body)`; `None` when the issue has no comments.
+pub type Comment = Option<(String, String)>;
+
+/// Fetch the last comment of the issue with
+/// `gh issue view <n> -R <repo> --json comments --jq '.comments[-1]'`.
+pub async fn latest_comment(repository: &str, number: u64) -> Result<Comment, String> {
+    let output = Command::new("gh")
+        .args(["issue", "view", &number.to_string(), "-R", repository])
+        .args(["--json", "comments", "--jq", ".comments[-1]"])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("gh: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_comment(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_comment(text: &str) -> Result<Comment, String> {
+    let text = text.trim();
+    if text.is_empty() || text == "null" {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let field = |key: &str| value[key].as_str().unwrap_or_default().to_string();
+    Ok(Some((field("id"), field("body"))))
+}
+
+/// Remembers the last comment of each issue to detect new comments.
+#[derive(Debug, Default)]
+pub struct CommentTracker {
+    last: HashMap<(String, u64), Comment>,
+}
+
+impl CommentTracker {
+    /// Store the comment and return whether it differs from the previous one
+    /// (the first observation counts as changed).
+    pub fn update(&mut self, repository: &str, number: u64, comment: Comment) -> bool {
+        let key = (repository.to_ascii_lowercase(), number);
+        self.last.insert(key, comment.clone()) != Some(comment)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -172,5 +220,31 @@ mod tests {
         assert_eq!(out.stdout, "3\n");
         assert_eq!(out.stderr, "err\n");
         assert_eq!(out.status, Some(2));
+    }
+
+    #[test]
+    fn parse_last_comment() {
+        assert_eq!(parse_comment(""), Ok(None));
+        assert_eq!(parse_comment("null\n"), Ok(None));
+        assert_eq!(
+            parse_comment(r#"{"id":"IC_1","body":"hi","author":{"login":"me"}}"#),
+            Ok(Some(("IC_1".into(), "hi".into())))
+        );
+        assert!(parse_comment("{").is_err());
+    }
+
+    #[test]
+    fn track_comment_changes() {
+        let c = |id: &str, body: &str| Some((id.to_string(), body.to_string()));
+        let mut tracker = CommentTracker::default();
+        // first observation
+        assert!(tracker.update("o/r", 1, None));
+        assert!(!tracker.update("o/r", 1, None));
+        assert!(tracker.update("o/r", 1, c("1", "a")));
+        assert!(!tracker.update("O/R", 1, c("1", "a")));
+        // edited body
+        assert!(tracker.update("o/r", 1, c("1", "b")));
+        // other issue is tracked separately
+        assert!(tracker.update("o/r", 2, c("1", "b")));
     }
 }

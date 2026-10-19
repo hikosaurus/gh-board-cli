@@ -4,7 +4,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::app::{App, Focus, LogKind};
+use crate::app::{App, Focus, IssueKey, LogKind, issue_key};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status] =
@@ -27,53 +27,60 @@ fn pane(title: String, focused: bool) -> Block<'static> {
 }
 
 fn draw_board(frame: &mut Frame, app: &mut App, area: Rect) {
-    let title = match &app.board {
-        Some(b) => format!(" {}/{} ", b.owner, b.title),
-        None => format!(" {} ", app.repository),
-    };
     let mut lines: Vec<Line> = vec![];
-    // (line index, issue number) of clickable rows
-    let mut links: Vec<(usize, u64)> = vec![];
+    // (line index, issue) of clickable rows
+    let mut links: Vec<(usize, IssueKey)> = vec![];
     if let Some(e) = &app.board_error {
         lines.push(Line::from(e.clone()).red());
     }
     match &app.board {
         Some(board) => {
-            for (i, column) in board.columns.iter().enumerate() {
+            for (i, project) in board.projects.iter().enumerate() {
                 if i > 0 {
                     lines.push(Line::default());
                 }
-                lines.push(Line::from(format!("[{}]", column.name)).bold().yellow());
-                if column.issues.is_empty() {
-                    lines.push(Line::from("No items").dark_gray());
-                }
-                for issue in &column.issues {
-                    let mut spans = vec![
-                        Span::from(format!("#{} ", issue.number)).fg(Color::Cyan),
-                        Span::from(issue.title.clone()),
-                    ];
-                    if app.active_issues.contains_key(&issue.number) {
-                        spans.push(Span::from(" 🟢"));
+                lines.push(
+                    Line::from(format!("[{}/{}]", project.owner, project.title))
+                        .bold()
+                        .cyan(),
+                );
+                for column in &project.columns {
+                    lines.push(Line::from(format!("{}>", column.name)).bold().yellow());
+                    if column.issues.is_empty() {
+                        lines.push(Line::from(" No items").dark_gray());
                     }
-                    links.push((lines.len(), issue.number));
-                    lines.push(Line::from(spans));
+                    for issue in &column.issues {
+                        let key = issue_key(&issue.repository, issue.number);
+                        let mut spans = vec![
+                            Span::from(format!(" #{} ", issue.number)).fg(Color::Cyan),
+                            Span::from(issue.title.clone()),
+                        ];
+                        if app.active_issues.contains_key(&key) {
+                            spans.push(Span::from(" 🟢"));
+                        }
+                        links.push((lines.len(), key));
+                        lines.push(Line::from(spans));
+                    }
                 }
+            }
+            if board.projects.is_empty() {
+                lines.push(Line::from("No projects").dark_gray());
             }
         }
         None if app.board_error.is_none() => lines.push(Line::from("loading...").dark_gray()),
         None => {}
     }
 
-    let block = pane(title, app.focus == Focus::Board);
+    let block = pane(" Projects ".into(), app.focus == Focus::Board);
     let inner = block.inner(area);
     app.board_area = area;
     app.issue_links = links
         .into_iter()
-        .filter_map(|(index, number)| {
+        .filter_map(|(index, key)| {
             let row = (index as u16).checked_sub(app.board_scroll)?;
             (row < inner.height).then(|| {
                 let width = (lines[index].width() as u16).min(inner.width);
-                (Rect::new(inner.x, inner.y + row, width, 1), number)
+                (Rect::new(inner.x, inner.y + row, width, 1), key)
             })
         })
         .collect();
@@ -125,19 +132,16 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::{Board, Column, Issue};
+    use crate::board::{Board, Column, Issue, Project};
     use crate::config::Config;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    #[tokio::test]
-    async fn draw_board_sections_and_links() {
-        let config = Config::parse(r#"{ "listen": "ws://x" }"#).unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new("owner/repo".into(), config, tx);
-        app.board = Some(Board {
+    fn project(title: &str, issues: Vec<(&str, u64, &str)>) -> Project {
+        Project {
+            id: String::new(),
             owner: "owner".into(),
-            title: "proj".into(),
+            title: title.into(),
             columns: vec![
                 Column {
                     name: "Todo".into(),
@@ -145,16 +149,34 @@ mod tests {
                 },
                 Column {
                     name: "In Progress".into(),
-                    issues: vec![Issue {
-                        number: 3,
-                        title: "hello".into(),
-                        updated_at: String::new(),
-                    }],
+                    issues: issues
+                        .into_iter()
+                        .map(|(repository, number, title)| Issue {
+                            repository: repository.into(),
+                            number,
+                            title: title.into(),
+                            updated_at: String::new(),
+                        })
+                        .collect(),
                 },
             ],
-        });
+        }
+    }
 
-        let mut terminal = Terminal::new(TestBackend::new(60, 10)).unwrap();
+    #[tokio::test]
+    async fn draw_projects_and_links() {
+        let config = Config::parse(r#"{ "listen": "ws://x" }"#).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(config, tx);
+        app.board = Some(Board {
+            projects: vec![
+                project("p1", vec![("owner/a", 3, "hello")]),
+                project("p2", vec![("owner/b", 3, "world")]),
+            ],
+        });
+        app.active_issues.insert(issue_key("owner/b", 3), 1);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 14)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -165,16 +187,37 @@ mod tests {
                 .trim_end()
                 .to_string()
         };
-        let rows: Vec<_> = (1..6).map(row).collect();
+        let rows: Vec<_> = (1..11).map(row).collect();
         assert_eq!(
             rows,
-            vec!["[Todo]", "No items", "", "[In Progress]", "#3 hello"]
+            vec![
+                "[owner/p1]",
+                "Todo>",
+                " No items",
+                "In Progress>",
+                " #3 hello",
+                "",
+                "[owner/p2]",
+                "Todo>",
+                " No items",
+                "In Progress>",
+            ]
         );
-        assert_eq!(app.issue_links, vec![(Rect::new(1, 5, 8, 1), 3)]);
+        assert!(row(11).starts_with(" #3 world 🟢"));
+        assert_eq!(
+            app.issue_links,
+            vec![
+                (Rect::new(1, 5, 9, 1), issue_key("owner/a", 3)),
+                (Rect::new(1, 11, 12, 1), issue_key("owner/b", 3)),
+            ]
+        );
 
         // links follow scrolling
         app.board_scroll = 2;
         terminal.draw(|f| draw(f, &mut app)).unwrap();
-        assert_eq!(app.issue_links, vec![(Rect::new(1, 3, 8, 1), 3)]);
+        assert_eq!(
+            app.issue_links[0],
+            (Rect::new(1, 3, 9, 1), issue_key("owner/a", 3))
+        );
     }
 }

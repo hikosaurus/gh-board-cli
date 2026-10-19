@@ -10,8 +10,15 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::board::{self, Board};
 use crate::config::{Config, HookAction};
-use crate::hook::{self, CommandOutput};
+use crate::hook::{self, CommandOutput, CommentTracker};
 use crate::payload::Payload;
+
+/// `(lowercased repository, issue number)`
+pub type IssueKey = (String, u64);
+
+pub fn issue_key(repository: &str, number: u64) -> IssueKey {
+    (repository.to_ascii_lowercase(), number)
+}
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -23,8 +30,10 @@ pub enum AppEvent {
     Status(String),
     /// Payload received from WebSocket
     Received(Payload),
-    /// Hook action finished (issue number of the event, output)
-    HookDone(Option<u64>, CommandOutput),
+    /// Hook action finished
+    HookDone(Option<IssueKey>, CommandOutput),
+    /// Hook actions were not run (issue, count of actions, reason)
+    HookSkipped(Option<IssueKey>, usize, String),
     Board(Result<Board, String>),
 }
 
@@ -51,7 +60,6 @@ pub enum Focus {
 }
 
 pub struct App {
-    pub repository: String,
     config: Config,
     tx: UnboundedSender<AppEvent>,
     hook_tx: UnboundedSender<HookJob>,
@@ -61,8 +69,8 @@ pub struct App {
     pub loading: bool,
     /// Refresh requested while loading
     refresh_pending: bool,
-    /// Issue number -> count of hook actions not yet finished
-    pub active_issues: HashMap<u64, usize>,
+    /// Issue -> count of hook actions not yet finished
+    pub active_issues: HashMap<IssueKey, usize>,
     pub log: Vec<LogLine>,
     pub status: String,
 
@@ -75,17 +83,16 @@ pub struct App {
     /// Pane areas and clickable issue rows, updated by the renderer
     pub board_area: Rect,
     pub log_area: Rect,
-    pub issue_links: Vec<(Rect, u64)>,
+    pub issue_links: Vec<(Rect, IssueKey)>,
     pub quit: bool,
 }
 
 type HookJob = (Payload, Vec<HookAction>);
 
 impl App {
-    pub fn new(repository: String, config: Config, tx: UnboundedSender<AppEvent>) -> Self {
+    pub fn new(config: Config, tx: UnboundedSender<AppEvent>) -> Self {
         let hook_tx = spawn_hook_worker(tx.clone());
         Self {
-            repository,
             config,
             tx,
             hook_tx,
@@ -114,11 +121,8 @@ impl App {
         }
         self.loading = true;
         let tx = self.tx.clone();
-        let repository = self.repository.clone();
         tokio::spawn(async move {
-            let result = board::fetch(&repository)
-                .await
-                .map_err(|e| format!("{e:#}"));
+            let result = board::fetch().await.map_err(|e| format!("{e:#}"));
             let _ = tx.send(AppEvent::Board(result));
         });
     }
@@ -131,6 +135,10 @@ impl App {
             AppEvent::Status(status) => self.status = status,
             AppEvent::Received(payload) => self.on_received(payload),
             AppEvent::HookDone(issue, output) => self.on_hook_done(issue, output),
+            AppEvent::HookSkipped(issue, count, reason) => {
+                self.finish_actions(issue.as_ref(), count);
+                self.push(LogKind::Skipped, format!("  skipped: {reason}"));
+            }
             AppEvent::Board(result) => {
                 self.loading = false;
                 match result {
@@ -181,8 +189,8 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.focus = pane;
                 let link = self.issue_links.iter().find(|(r, _)| r.contains(pos));
-                if let Some(&(_, number)) = link {
-                    self.open_issue(number);
+                if let Some((_, (repository, number))) = link.cloned() {
+                    self.open_issue(repository, number);
                 }
             }
             MouseEventKind::ScrollDown => self.scroll_pane(pane, 1),
@@ -191,10 +199,9 @@ impl App {
         }
     }
 
-    fn open_issue(&mut self, number: u64) {
-        self.status = format!("opening #{number}");
+    fn open_issue(&mut self, repository: String, number: u64) {
+        self.status = format!("opening {repository}#{number}");
         let tx = self.tx.clone();
-        let repository = self.repository.clone();
         tokio::spawn(async move {
             let result = Command::new("gh")
                 .args(["issue", "view", &number.to_string(), "--web"])
@@ -205,7 +212,7 @@ impl App {
                 .output()
                 .await;
             let status = match result {
-                Ok(o) if o.status.success() => format!("opened #{number}"),
+                Ok(o) if o.status.success() => format!("opened {repository}#{number}"),
                 Ok(o) => format!("gh: {}", String::from_utf8_lossy(&o.stderr).trim()),
                 Err(e) => format!("gh: {e}"),
             };
@@ -236,15 +243,21 @@ impl App {
             .map(|n| format!("#{n} "))
             .unwrap_or_default();
 
-        if !payload.repository.eq_ignore_ascii_case(&self.repository) {
+        if !self.config.is_target(&payload.repository) {
             self.push(
                 LogKind::Skipped,
-                format!("⚡️ {issue}{hook_type} ({}: skipped)", payload.repository),
+                format!(
+                    "⚡️ {issue}{hook_type} ({}: not in targets)",
+                    payload.repository
+                ),
             );
             return;
         }
 
-        self.push(LogKind::Event, format!("⚡️ {issue}{hook_type}"));
+        self.push(
+            LogKind::Event,
+            format!("⚡️ {issue}{hook_type} ({})", payload.repository),
+        );
 
         let actions: Vec<HookAction> = hook::select(&self.config, &payload)
             .into_iter()
@@ -252,22 +265,18 @@ impl App {
             .collect();
         if !actions.is_empty() {
             if let Some(n) = payload.issue_number {
-                *self.active_issues.entry(n).or_default() += actions.len();
+                *self
+                    .active_issues
+                    .entry(issue_key(&payload.repository, n))
+                    .or_default() += actions.len();
             }
             let _ = self.hook_tx.send((payload, actions));
         }
         self.refresh_board();
     }
 
-    fn on_hook_done(&mut self, issue: Option<u64>, output: CommandOutput) {
-        if let Some(n) = issue
-            && let Some(count) = self.active_issues.get_mut(&n)
-        {
-            *count -= 1;
-            if *count == 0 {
-                self.active_issues.remove(&n);
-            }
-        }
+    fn on_hook_done(&mut self, issue: Option<IssueKey>, output: CommandOutput) {
+        self.finish_actions(issue.as_ref(), 1);
         self.push(LogKind::Command, format!("  $ {}", output.command));
         for line in output.stdout.lines() {
             self.push(LogKind::Stdout, format!("    {line}"));
@@ -281,20 +290,54 @@ impl App {
         self.push(LogKind::Exit, format!("    exit {status}"));
     }
 
+    fn finish_actions(&mut self, issue: Option<&IssueKey>, count: usize) {
+        if let Some(key) = issue
+            && let Some(remaining) = self.active_issues.get_mut(key)
+        {
+            *remaining = remaining.saturating_sub(count);
+            if *remaining == 0 {
+                self.active_issues.remove(key);
+            }
+        }
+    }
+
     fn push(&mut self, kind: LogKind, text: String) {
         self.log.push(LogLine { kind, text });
     }
 }
 
 /// Run hook actions sequentially so that outputs keep the order of events.
+///
+/// For issue events, actions run only when the last comment of the issue
+/// changed since the previous check (or it is the first check).
 fn spawn_hook_worker(tx: UnboundedSender<AppEvent>) -> UnboundedSender<HookJob> {
     let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<HookJob>();
     tokio::spawn(async move {
+        let mut tracker = CommentTracker::default();
         while let Some((payload, actions)) = hook_rx.recv().await {
+            let issue = payload
+                .issue_number
+                .map(|n| issue_key(&payload.repository, n));
+
+            if let Some(n) = payload.issue_number {
+                let skipped = match hook::latest_comment(&payload.repository, n).await {
+                    Ok(comment) => (!tracker.update(&payload.repository, n, comment))
+                        .then(|| "no new comment".to_string()),
+                    Err(e) => Some(e),
+                };
+                if let Some(reason) = skipped {
+                    let reason = format!("{} #{n}: {reason}", payload.hook_type());
+                    let event = AppEvent::HookSkipped(issue, actions.len(), reason);
+                    if tx.send(event).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+
             for action in &actions {
                 let output = hook::run(action, &payload).await;
-                let done = AppEvent::HookDone(payload.issue_number, output);
-                if tx.send(done).is_err() {
+                if tx.send(AppEvent::HookDone(issue.clone(), output)).is_err() {
                     return;
                 }
             }
@@ -317,42 +360,63 @@ mod tests {
         }
     }
 
+    fn payload(repository: &str, event_name: &str) -> Payload {
+        Payload::from_value(json!({
+            "repository": repository,
+            "event_name": event_name,
+            "event_action": "opened",
+            "issue_number": 3
+        }))
+        .unwrap()
+    }
+
+    fn app(config: &str) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(Config::parse(config).unwrap(), tx)
+    }
+
     #[tokio::test]
     async fn active_issue_is_cleared_after_actions_finish() {
-        let config = Config::parse(
-            r#"{
-                "listen": "ws://x",
-                "hooks": {
-                    "issues:*": [
-                        { "type": "command", "command": "true" },
-                        { "type": "command", "command": "true" }
-                    ]
-                }
-            }"#,
-        )
-        .unwrap();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new("owner/repo".into(), config, tx);
-
-        let payload = |event_name: &str| {
-            Payload::from_value(json!({
-                "repository": "owner/repo",
-                "event_name": event_name,
-                "event_action": "opened",
-                "issue_number": 3
-            }))
-            .unwrap()
-        };
+        let mut app = app(r#"{
+            "listen": "ws://x",
+            "hooks": {
+                "issues:*": [
+                    { "type": "command", "command": "true" },
+                    { "type": "command", "command": "true" }
+                ]
+            }
+        }"#);
+        let key = issue_key("Owner/Repo", 3);
 
         // no matching hook -> not marked
-        app.handle(AppEvent::Received(payload("issue_comment")));
+        app.handle(AppEvent::Received(payload("owner/repo", "issue_comment")));
         assert!(app.active_issues.is_empty());
 
-        app.handle(AppEvent::Received(payload("issues")));
-        assert_eq!(app.active_issues.get(&3), Some(&2));
-        app.handle(AppEvent::HookDone(Some(3), output()));
-        assert_eq!(app.active_issues.get(&3), Some(&1));
-        app.handle(AppEvent::HookDone(Some(3), output()));
+        app.handle(AppEvent::Received(payload("Owner/Repo", "issues")));
+        assert_eq!(app.active_issues.get(&key), Some(&2));
+        app.handle(AppEvent::HookDone(Some(key.clone()), output()));
+        assert_eq!(app.active_issues.get(&key), Some(&1));
+        app.handle(AppEvent::HookDone(Some(key.clone()), output()));
         assert!(app.active_issues.is_empty());
+
+        // skipped actions also clear the mark
+        app.handle(AppEvent::Received(payload("owner/repo", "issues")));
+        app.handle(AppEvent::HookSkipped(Some(key), 2, "no new comment".into()));
+        assert!(app.active_issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ignore_repositories_not_in_targets() {
+        let mut app = app(r#"{
+            "listen": "ws://x",
+            "targets": ["owner/repo"],
+            "hooks": { "issues:*": [{ "type": "command", "command": "true" }] }
+        }"#);
+        app.handle(AppEvent::Received(payload("owner/other", "issues")));
+        assert!(app.active_issues.is_empty());
+        assert_eq!(app.log.last().unwrap().kind, LogKind::Skipped);
+
+        app.handle(AppEvent::Received(payload("owner/repo", "issues")));
+        assert_eq!(app.active_issues.len(), 1);
     }
 }
