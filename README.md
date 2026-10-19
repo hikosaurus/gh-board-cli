@@ -29,6 +29,7 @@ gh-board-cli
 
 - 左ペインは `gh project list` で取得した開いている Project ごとに、Status 別の Issue を表示します（Done は更新日時が新しい順に最大10件）
 - 🟢 はその Issue のイベントに一致した Hook を実行中であることを示します
+- 右ペインには受信イベントと Hook の出力を表示します。Hook の出力は1行ずつ届いた時点で表示し、`[#n]` でどの Issue の Hook かを示します
 - マウス入力を有効にしているため、ターミナルでの文字選択は Shift (iTerm2 / Terminal.app では Option) を押しながら行ってください
 
 ## 設定 (`.ghboard.yaml`)
@@ -109,10 +110,18 @@ Pusher の envelope（`{"event": "...", "data": "<payload の JSON 文字列>"}`
 
 実行しなかった HookAction は、右ペインに `skipped: <HookType> #n: <理由>` と表示します。
 
+### Hook の実行順序
+
+- 別の Issue の Hook は並行して実行します
+- 同じ Issue へのイベントは受信順に1つずつ処理します（コメントの前回値との比較が順序に依存するため）
+- 1つのイベントに一致した複数の HookAction は、設定順に1つずつ実行します
+
 ## 開発
 
 ```sh
 cargo test
 # Pusher 互換のモックサーバー（ws://127.0.0.1:8765）
 cargo run --example mock_server -- "<owner>/<repo>"
+# ポートと Issue 番号を指定（#1 と #2 に交互にイベントを送信）
+cargo run --example mock_server -- "<owner>/<repo>" 8765 1,2
 ```
