@@ -35,7 +35,10 @@ async fn session(
     while let Some(msg) = ws.next().await {
         let text = match msg? {
             WsMessage::Text(text) => text,
-            WsMessage::Close(_) => break,
+            WsMessage::Close(Some(frame)) => {
+                anyhow::bail!("connection closed ({} {})", frame.code, frame.reason)
+            }
+            WsMessage::Close(None) => break,
             _ => continue,
         };
         match parse_message(&text) {
@@ -55,6 +58,9 @@ async fn session(
             Message::PusherPing => {
                 let pong = json!({ "event": "pusher:pong", "data": {} });
                 ws.send(WsMessage::text(pong.to_string())).await?;
+            }
+            Message::PusherControl(event) if event == "pusher:error" => {
+                let _ = tx.send(AppEvent::Status(format!("pusher error: {text}")));
             }
             Message::PusherControl(_) => {}
             Message::Unknown(text) => {
