@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -17,32 +16,25 @@ pub struct Config {
     /// Repositories (`{owner}/{repo}`) to handle. Empty means all repositories.
     #[serde(default)]
     pub targets: Vec<String>,
-    /// HookType (`{event_name}:{event_action}`) -> HookActions
+    /// Hook actions in config order
     #[serde(default)]
-    pub hooks: BTreeMap<String, Vec<HookAction>>,
+    pub hooks: Vec<HookAction>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum HookAction {
-    Command {
-        /// Issue statuses to run on. Empty means any status.
-        #[serde(default)]
-        status: Vec<String>,
-        command: String,
-    },
+pub struct HookAction {
+    /// HookType (`{event_name}:{event_action}`) patterns to run on
+    pub on: Vec<String>,
+    /// Issue statuses to run on. Empty means any status.
+    #[serde(default)]
+    pub status: Vec<String>,
+    pub command: String,
 }
 
 impl HookAction {
-    pub fn statuses(&self) -> &[String] {
-        let HookAction::Command { status, .. } = self;
-        status
-    }
-
     /// Whether the action runs for an issue with the given project statuses.
     pub fn accepts(&self, issue_statuses: &[String]) -> bool {
-        let statuses = self.statuses();
-        statuses.is_empty() || issue_statuses.iter().any(|s| statuses.contains(s))
+        self.status.is_empty() || issue_statuses.iter().any(|s| self.status.contains(s))
     }
 }
 
@@ -87,21 +79,32 @@ mod tests {
             r#"
 listen: wss://example.com/app/key
 hooks:
-  issues:*:
-    - type: command
-      command: echo ${{ event.issue.id }}
+  - on:
+      - "issues:*"
+      - "issue_comment:*"
+    status:
+      - 'In Progress'
+      - 'In Review'
+    command: |
+      echo ${{ event.issue.id }}
 "#,
         )
         .unwrap();
         assert_eq!(config.listen, "wss://example.com/app/key");
         assert_eq!(config.channel, None);
         assert_eq!(
-            config.hooks["issues:*"],
-            vec![HookAction::Command {
-                status: vec![],
-                command: "echo ${{ event.issue.id }}".into()
+            config.hooks,
+            vec![HookAction {
+                on: vec!["issues:*".into(), "issue_comment:*".into()],
+                status: vec!["In Progress".into(), "In Review".into()],
+                command: "echo ${{ event.issue.id }}\n".into()
             }]
         );
+    }
+
+    #[test]
+    fn on_is_required() {
+        assert!(Config::parse("listen: ws://x\nhooks:\n  - command: a").is_err());
     }
 
     #[test]
@@ -110,16 +113,15 @@ hooks:
             r#"
 listen: ws://x
 hooks:
-  issues:*:
-    - type: command
-      status: [In Progress, In Review]
-      command: a
-    - type: command
-      command: b
+  - on: ["issues:*"]
+    status: [In Progress, In Review]
+    command: a
+  - on: ["issues:*"]
+    command: b
 "#,
         )
         .unwrap();
-        let [some, any] = &config.hooks["issues:*"][..] else {
+        let [some, any] = &config.hooks[..] else {
             panic!()
         };
         let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -151,27 +153,29 @@ hooks:
             .and_then(|s| s.split("```").next())
             .unwrap();
         let config = Config::parse(example).unwrap();
+        let [first, second] = &config.hooks[..] else {
+            panic!()
+        };
+        assert_eq!(first.on, ["issues:*", "issue_comment:*"]);
+        assert_eq!(first.status, ["In Progress", "In Review"]);
         assert_eq!(
-            config.hooks["issue_comment:created"],
-            vec![HookAction::Command {
+            second,
+            &HookAction {
+                on: vec!["issue_comment:created".into()],
                 status: vec![],
                 command: r#"echo "${{ event_name }}:${{ event_action }} #${{ issue_number }}""#
                     .into()
-            }]
-        );
-        assert_eq!(
-            config.hooks["issues:*"][0].statuses(),
-            ["In Progress", "In Review"]
+            }
         );
     }
 
     #[test]
     fn parse_json_style() {
-        // YAML is a superset of JSON, so the former JSON config still parses.
+        // YAML is a superset of JSON, so JSON config also parses.
         let config = Config::parse(
-            r#"{ "listen": "ws://x", "hooks": { "issues:*": [{ "type": "command", "command": "a" }] } }"#,
+            r#"{ "listen": "ws://x", "hooks": [{ "on": ["issues:*"], "command": "a" }] }"#,
         )
         .unwrap();
-        assert_eq!(config.hooks["issues:*"].len(), 1);
+        assert_eq!(config.hooks.len(), 1);
     }
 }

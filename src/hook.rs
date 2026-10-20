@@ -26,14 +26,13 @@ pub fn matches(pattern: &str, hook_type: &str) -> bool {
     Regex::new(&regex).is_ok_and(|r| r.is_match(hook_type))
 }
 
-/// Hook actions whose HookType matches the payload, in config order.
+/// Hook actions with an `on` pattern matching the payload, in config order.
 pub fn select<'a>(config: &'a Config, payload: &Payload) -> Vec<&'a HookAction> {
     let hook_type = payload.hook_type();
     config
         .hooks
         .iter()
-        .filter(|(pattern, _)| matches(pattern, &hook_type))
-        .flat_map(|(_, actions)| actions)
+        .filter(|action| action.on.iter().any(|p| matches(p, &hook_type)))
         .collect()
 }
 
@@ -145,8 +144,7 @@ pub async fn run(
     payload: &Payload,
     on_output: impl Fn(HookOutput),
 ) -> Option<i32> {
-    let HookAction::Command { command, .. } = action;
-    let command = expand(command, payload);
+    let command = expand(&action.command, payload);
     on_output(HookOutput::Started(command.clone()));
     let child = Command::new("sh")
         .arg("-c")
@@ -241,26 +239,25 @@ mod tests {
         let config = Config::parse(
             r#"{
                 "listen": "wss://x",
-                "hooks": {
-                    "issues:*": [{ "type": "command", "command": "a" }],
-                    "issues:closed": [{ "type": "command", "command": "b" }],
-                    "issue_comment:*": [{ "type": "command", "command": "c" }]
-                }
+                "hooks": [
+                    { "on": ["issue_comment:*", "issues:*"], "command": "a" },
+                    { "on": ["issues:closed"], "command": "b" },
+                    { "on": ["issue_comment:*"], "command": "c" },
+                    { "on": ["*:opened"], "command": "d" }
+                ]
             }"#,
         )
         .unwrap();
-        let selected = select(&config, &payload());
-        assert_eq!(
-            selected,
-            vec![&HookAction::Command {
-                status: vec![],
-                command: "a".into()
-            }]
-        );
+        let selected: Vec<_> = select(&config, &payload())
+            .into_iter()
+            .map(|a| a.command.as_str())
+            .collect();
+        assert_eq!(selected, ["a", "d"]);
     }
 
     fn command(command: &str) -> HookAction {
-        HookAction::Command {
+        HookAction {
+            on: vec!["*".into()],
             status: vec![],
             command: command.into(),
         }

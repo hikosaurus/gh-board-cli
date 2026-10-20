@@ -385,7 +385,7 @@ fn status_mismatch(action: &HookAction, statuses: &[String]) -> String {
     };
     format!(
         "status is {actual} (expected: {})",
-        action.statuses().join(", ")
+        action.status.join(", ")
     )
 }
 
@@ -413,12 +413,10 @@ mod tests {
     async fn active_issue_is_cleared_after_actions_finish() {
         let mut app = app(r#"{
             "listen": "ws://x",
-            "hooks": {
-                "issues:*": [
-                    { "type": "command", "command": "true" },
-                    { "type": "command", "command": "true" }
-                ]
-            }
+            "hooks": [
+                { "on": ["issues:*"], "command": "true" },
+                { "on": ["issues:*"], "command": "true" }
+            ]
         }"#);
         let key = issue_key("Owner/Repo", 3);
 
@@ -444,7 +442,7 @@ mod tests {
         let mut app = app(r#"{
             "listen": "ws://x",
             "targets": ["owner/repo"],
-            "hooks": { "issues:*": [{ "type": "command", "command": "true" }] }
+            "hooks": [{ "on": ["issues:*"], "command": "true" }]
         }"#);
         app.handle(AppEvent::Received(payload("owner/other", "issues")));
         assert!(app.active_issues.is_empty());
