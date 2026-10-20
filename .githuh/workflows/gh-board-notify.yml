@@ -1,0 +1,55 @@
+name: gh-board-notify
+
+on:
+  issues:
+    types: [opened, closed]
+  issue_comment:
+    types: [created]
+  project_card:
+    types: [moved]
+
+permissions: {}
+
+jobs:
+  pusher-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Pusher
+        run: python3 -m pip install pusher==3.3.4
+      - name: Send event to Pusher
+        env:
+          PUSHER_APP_ID: "2202666"
+          PUSHER_CLUSTER: ap3
+          PUSHER_KEY: ${{ secrets.GHBOARD_PUSHER_APP_KEY }}
+          PUSHER_SECRET: ${{ secrets.GHBOARD_PUSHER_APP_SECRET }}
+        run: |
+          python3 - <<'EOF'
+          import json
+          import os
+
+          import pusher
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as file:
+              event = json.load(file)
+
+          # The full payload easily exceeds the 10KB limit of Pusher, so only
+          # what clients need to refresh is sent.
+          data = {
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "event_name": os.environ["GITHUB_EVENT_NAME"],
+              "action": event.get("action"),
+              "issue_number": (event.get("issue") or {}).get("number"),
+              "sender": (event.get("sender") or {}).get("login"),
+          }
+          data = {key: value for key, value in data.items() if value is not None}
+
+          pusher_client = pusher.Pusher(
+              app_id=os.environ["PUSHER_APP_ID"],
+              key=os.environ["PUSHER_KEY"],
+              secret=os.environ["PUSHER_SECRET"],
+              cluster=os.environ["PUSHER_CLUSTER"],
+              ssl=True,
+          )
+          pusher_client.trigger("gh-board", "github-event", data)
+          print(f"Published to Pusher: {data}")
+          EOF
