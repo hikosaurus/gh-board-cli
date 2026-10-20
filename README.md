@@ -46,26 +46,30 @@ targets:
   - owner/repo01
   - owner/repo02
 hooks:
-  issues:*:
-    - type: command
-      status: [In Progress, In Review]
-      command: echo ${{ issue_number }}
-  issue_comment:created:
-    - type: command
-      command: 'echo "${{ event_name }}:${{ event_action }} #${{ issue_number }}"'
+  - on:
+      - "issues:*"
+      - "issue_comment:*"
+    status:
+      - 'In Progress'
+      - 'In Review'
+    command: |
+      echo ${{ issue_number }}
+  - on:
+      - "issue_comment:created"
+    command: 'echo "${{ event_name }}:${{ event_action }} #${{ issue_number }}"'
 ```
 
 > [!TIP]
-> YAML では、値に ` #`（コメント扱い）や `: ` が含まれると意図どおりに読み込まれません。`command` はクォートで囲むと安全です。
+> YAML では、値に ` #`（コメント扱い）や `: ` が含まれると意図どおりに読み込まれません。`command` はクォートで囲むか、`|` のブロック形式で書くと安全です。
 
 - `listen`: 購読する WebSocket の URL
 - `channel` (任意): Pusher のチャンネル名。指定時は接続後に `pusher:subscribe` を送信します
 - `targets` (任意): Hook の対象リポジトリ。空・未指定なら全リポジトリが対象です
-- `hooks`: HookType → HookAction の配列
-  - HookType: `{event_name}:{event_action}`。`*` は任意の文字列に一致します
-  - HookAction: `type: command` と `command`、任意で `status`
-    - `command`: `sh -c` で実行するコマンド
-    - `status` (任意): 実行対象とする Issue の Project ステータス。空・未指定ならステータスに関係なく実行します
+- `hooks`: HookAction の配列
+  - `on`: 実行対象とする HookType の配列。いずれかに一致すれば実行します
+    - HookType: `{event_name}:{event_action}`。`*` は任意の文字列に一致します
+  - `status` (任意): 実行対象とする Issue の Project ステータス。空・未指定ならステータスに関係なく実行します
+  - `command`: `sh -c` で実行するコマンド
 
 ### 組み込み変数
 
@@ -99,7 +103,7 @@ Pusher の envelope（`{"event": "...", "data": "<payload の JSON 文字列>"}`
 ### Hook の実行条件
 
 1. `targets` が空、または `repository` が `targets` に含まれる
-2. HookType `{event_name}:{event_action}` が一致する
+2. HookType `{event_name}:{event_action}` が HookAction の `on` のいずれかに一致する
 3. `issue_number` がある場合、`gh issue view <issue_number> -R <repository> --json comments,projectItems` で取得した最新コメントの `(id, body)` が前回の取得値と異なる（初回は実行）
    - 前回値はリポジトリ + Issue 番号ごとに保持します（起動中のみ）
    - `gh` の実行に失敗した場合は Hook を実行しません
