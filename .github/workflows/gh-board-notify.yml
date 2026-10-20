@@ -2,7 +2,7 @@ name: gh-board-notify
 
 on:
   issues:
-    types: [opened, closed]
+    types: [opened, edited, closed]
   issue_comment:
     types: [created]
   project_card:
