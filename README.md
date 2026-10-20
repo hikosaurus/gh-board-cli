@@ -104,13 +104,16 @@ Pusher の envelope（`{"event": "...", "data": "<payload の JSON 文字列>"}`
 
 1. `targets` が空、または `repository` が `targets` に含まれる
 2. HookType `{event_name}:{event_action}` が HookAction の `on` のいずれかに一致する
-3. `issue_number` がある場合、`gh issue view <issue_number> -R <repository> --json comments,projectItems` で取得した最新コメントの `(id, body)` が前回の取得値と異なる（初回は実行）
-   - 前回値はリポジトリ + Issue 番号ごとに保持します（起動中のみ）
+3. HookAction の `status` が空・未指定、または Issue の Project ステータスが `status` に含まれる（HookAction ごとに判定）
+   - `issue_number` がある場合、`gh issue view <issue_number> -R <repository> --json comments,projectItems` で Issue の状態を取得します
    - `gh` の実行に失敗した場合は Hook を実行しません
-4. HookAction の `status` が空・未指定、または Issue の Project ステータスが `status` に含まれる（HookAction ごとに判定）
    - Issue が複数の Project に入っている場合は、いずれかのステータスが含まれれば実行します
    - ステータス名は大文字・小文字を区別して比較します
    - `issue_number` がないイベントでは、`status` を指定した HookAction は実行しません
+4. `issue_number` があり、Issue にコメントがある場合、最新コメントの `(id, body)` が前回の取得値と異なる（初回は実行）
+   - Issue にコメントが無い場合は判定せずに実行します
+   - 3 で全ての HookAction が実行対象外になった場合は判定しません（前回値も更新しません）
+   - 前回値はリポジトリ + Issue 番号ごとに保持します（起動中のみ）
 
 実行しなかった HookAction は、右ペインに `skipped: <HookType> #n: <理由>` と表示します。
 

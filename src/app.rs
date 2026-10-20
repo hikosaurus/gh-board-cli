@@ -315,14 +315,15 @@ impl App {
 /// Run hook actions of one issue sequentially so that the comment check and
 /// actions keep the order of events. Workers of different issues run concurrently.
 ///
-/// For issue events, actions run only when the last comment of the issue
-/// changed since the previous check (or it is the first check), and only
-/// when the issue status matches the action's `status` (if specified).
+/// For issue events, actions run only when the issue status matches the
+/// action's `status` (if specified), and then only when the last comment of
+/// the issue changed since the previous check (or it is the first check).
+/// The comment check is skipped when the issue has no comments.
 fn spawn_hook_worker(tx: UnboundedSender<AppEvent>) -> UnboundedSender<HookJob> {
     let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<HookJob>();
     tokio::spawn(async move {
         let mut tracker = CommentTracker::default();
-        while let Some((payload, actions)) = hook_rx.recv().await {
+        while let Some((payload, mut actions)) = hook_rx.recv().await {
             let issue = payload
                 .issue_number
                 .map(|n| issue_key(&payload.repository, n));
@@ -338,37 +339,63 @@ fn spawn_hook_worker(tx: UnboundedSender<AppEvent>) -> UnboundedSender<HookJob> 
                 AppEvent::HookSkipped(issue.clone(), count, format!("{label}: {reason}"))
             };
 
-            let mut statuses = Vec::new();
-            if let Some(n) = payload.issue_number {
-                let state = match hook::issue_state(&payload.repository, n).await {
-                    Ok(state) if tracker.update(&payload.repository, n, state.comment.clone()) => {
-                        Ok(state)
-                    }
-                    Ok(_) => Err("no new comment".to_string()),
-                    Err(e) => Err(e),
-                };
-                match state {
-                    Ok(state) => statuses = state.statuses,
+            let state = match payload.issue_number {
+                Some(n) => match hook::issue_state(&payload.repository, n).await {
+                    Ok(state) => Some((n, state)),
                     Err(reason) => {
                         if tx.send(skip(actions.len(), reason)).is_err() {
                             return;
                         }
                         continue;
                     }
+                },
+                None => None,
+            };
+
+            // Status check first (events without issue have no status)
+            let statuses = state
+                .as_ref()
+                .map(|(_, s)| s.statuses.clone())
+                .unwrap_or_default();
+            let (accepted, rejected) = actions
+                .into_iter()
+                .partition::<Vec<_>, _>(|action| action.accepts(&statuses));
+            for action in &rejected {
+                if tx
+                    .send(skip(1, status_mismatch(action, &statuses)))
+                    .is_err()
+                {
+                    return;
                 }
+            }
+            actions = accepted;
+            if actions.is_empty() {
+                continue;
+            }
+
+            // Then comment check, only when the issue has a comment
+            if let Some((n, state)) = state
+                && state.comment.is_some()
+                && !tracker.update(&payload.repository, n, state.comment)
+            {
+                if tx
+                    .send(skip(actions.len(), "no new comment".to_string()))
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
             }
 
             for action in &actions {
-                let event = if action.accepts(&statuses) {
-                    let status = hook::run(action, &payload, |output| {
-                        let _ = tx.send(AppEvent::HookOutput(tag.clone(), output));
-                    })
-                    .await;
-                    AppEvent::HookDone(issue.clone(), tag.clone(), status)
-                } else {
-                    skip(1, status_mismatch(action, &statuses))
-                };
-                if tx.send(event).is_err() {
+                let status = hook::run(action, &payload, |output| {
+                    let _ = tx.send(AppEvent::HookOutput(tag.clone(), output));
+                })
+                .await;
+                if tx
+                    .send(AppEvent::HookDone(issue.clone(), tag.clone(), status))
+                    .is_err()
+                {
                     return;
                 }
             }
