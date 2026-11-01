@@ -140,11 +140,11 @@ impl App {
             AppEvent::HookDone(issue, tag, status) => {
                 self.finish_actions(issue.as_ref(), 1);
                 let status = status.map_or("killed".to_string(), |c| c.to_string());
-                self.push(LogKind::Exit, format!("  [{tag}] exit {status}"));
+                self.push(LogKind::Exit, format!("{tag}   exit {status}"));
             }
             AppEvent::HookSkipped(issue, count, reason) => {
                 self.finish_actions(issue.as_ref(), count);
-                self.push(LogKind::Skipped, format!("  skipped: {reason}"));
+                self.push(LogKind::Skipped, reason);
             }
             AppEvent::Board(result) => {
                 self.loading = false;
@@ -244,27 +244,14 @@ impl App {
     }
 
     fn on_received(&mut self, payload: Payload) {
-        let hook_type = payload.hook_type();
-        let issue = payload
-            .issue_number
-            .map(|n| format!("#{n} "))
-            .unwrap_or_default();
+        let event = format!("{} ⚡️ {}", payload.log_prefix(), payload.hook_type());
 
         if !self.config.is_target(&payload.repository) {
-            self.push(
-                LogKind::Skipped,
-                format!(
-                    "⚡️ {issue}{hook_type} ({}: not in targets)",
-                    payload.repository
-                ),
-            );
+            self.push(LogKind::Skipped, format!("{event} (not in targets)"));
             return;
         }
 
-        self.push(
-            LogKind::Event,
-            format!("⚡️ {issue}{hook_type} ({})", payload.repository),
-        );
+        self.push(LogKind::Event, event);
 
         let actions: Vec<HookAction> = hook::select(&self.config, &payload)
             .into_iter()
@@ -289,11 +276,11 @@ impl App {
 
     fn on_hook_output(&mut self, tag: &str, output: HookOutput) {
         let (kind, text) = match output {
-            HookOutput::Started(command) => (LogKind::Command, format!("$ {command}")),
+            HookOutput::Started(command) => (LogKind::Command, format!("✏️ Action: {command}")),
             HookOutput::Stdout(line) => (LogKind::Stdout, format!("  {line}")),
             HookOutput::Stderr(line) => (LogKind::Stderr, format!("  {line}")),
         };
-        self.push(kind, format!("  [{tag}] {text}"));
+        self.push(kind, format!("{tag} {text}"));
     }
 
     fn finish_actions(&mut self, issue: Option<&IssueKey>, count: usize) {
@@ -327,16 +314,14 @@ fn spawn_hook_worker(tx: UnboundedSender<AppEvent>) -> UnboundedSender<HookJob> 
             let issue = payload
                 .issue_number
                 .map(|n| issue_key(&payload.repository, n));
-            let tag = match payload.issue_number {
-                Some(n) => format!("#{n}"),
-                None => payload.hook_type(),
-            };
-            let label = match payload.issue_number {
-                Some(n) => format!("{} #{n}", payload.hook_type()),
-                None => payload.hook_type(),
-            };
+            let tag = payload.log_prefix();
+            let hook_type = payload.hook_type();
             let skip = |count: usize, reason: String| {
-                AppEvent::HookSkipped(issue.clone(), count, format!("{label}: {reason}"))
+                AppEvent::HookSkipped(
+                    issue.clone(),
+                    count,
+                    format!("{tag}   skipped ({hook_type}): {reason}"),
+                )
             };
 
             let state = match payload.issue_number {
@@ -473,9 +458,29 @@ mod tests {
         }"#);
         app.handle(AppEvent::Received(payload("owner/other", "issues")));
         assert!(app.active_issues.is_empty());
-        assert_eq!(app.log.last().unwrap().kind, LogKind::Skipped);
+        let last = app.log.last().unwrap();
+        assert_eq!(last.kind, LogKind::Skipped);
+        assert_eq!(
+            last.text,
+            "[owner/other] #3 ⚡️ issues:opened (not in targets)"
+        );
 
         app.handle(AppEvent::Received(payload("owner/repo", "issues")));
         assert_eq!(app.active_issues.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn log_format() {
+        let mut app = app(r#"{ "listen": "ws://x", "hooks": [] }"#);
+        app.handle(AppEvent::Received(payload("owner/repo", "issues")));
+        assert_eq!(app.log[0].text, "[owner/repo] #3 ⚡️ issues:opened");
+
+        let tag = "[owner/repo] #3".to_string();
+        app.handle(AppEvent::HookOutput(
+            tag,
+            HookOutput::Started("echo hi".into()),
+        ));
+        assert_eq!(app.log[1].kind, LogKind::Command);
+        assert_eq!(app.log[1].text, "[owner/repo] #3 ✏️ Action: echo hi");
     }
 }

@@ -37,6 +37,14 @@ impl Payload {
     pub fn hook_type(&self) -> String {
         format!("{}:{}", self.event_name, self.event_action)
     }
+
+    /// Log prefix: `[{repository}] #{issue_number}` (`[{repository}]` without issue)
+    pub fn log_prefix(&self) -> String {
+        match self.issue_number {
+            Some(n) => format!("[{}] #{n}", self.repository),
+            None => format!("[{}]", self.repository),
+        }
+    }
 }
 
 /// Result of interpreting one WebSocket text message.
@@ -144,6 +152,16 @@ mod tests {
         let p = Payload::from_value(json!({ "repository": "o/r", "event_name": "push" })).unwrap();
         assert_eq!(p.hook_type(), "push:");
         assert_eq!(p.issue_number, None);
+        assert_eq!(p.log_prefix(), "[o/r]");
+    }
+
+    #[test]
+    fn log_prefix_with_issue() {
+        let p = Payload::from_value(
+            json!({ "repository": "o/r", "event_name": "issues", "issue_number": 3 }),
+        )
+        .unwrap();
+        assert_eq!(p.log_prefix(), "[o/r] #3");
     }
 
     #[test]

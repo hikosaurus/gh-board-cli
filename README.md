@@ -29,7 +29,9 @@ gh-board-cli
 
 - 左ペインは `gh project list` で取得した開いている Project ごとに、Status 別の Issue を表示します（Done は更新日時が新しい順に最大10件）
 - 🟢 はその Issue のイベントに一致した Hook を実行中であることを示します
-- 右ペインには受信イベントと Hook の出力を表示します。Hook の出力は1行ずつ届いた時点で表示し、`[#n]` でどの Issue の Hook かを示します
+- 右ペインには受信イベントと Hook の出力を表示します。Hook の出力は1行ずつ届いた時点で表示し、`[owner/repo] #n` でどの Issue の Hook かを示します
+  - イベント受信時: `[owner/repo] #n ⚡️ <event_name>:<event_action>`
+  - HookAction 実行時: `[owner/repo] #n ✏️ Action: <command>`
 - マウス入力を有効にしているため、ターミナルでの文字選択は Shift (iTerm2 / Terminal.app では Option) を押しながら行ってください
 
 ## 設定 (`.ghboard.yaml`)
@@ -115,7 +117,7 @@ Pusher の envelope（`{"event": "...", "data": "<payload の JSON 文字列>"}`
    - 3 で全ての HookAction が実行対象外になった場合は判定しません（前回値も更新しません）
    - 前回値はリポジトリ + Issue 番号ごとに保持します（起動中のみ）
 
-実行しなかった HookAction は、右ペインに `skipped: <HookType> #n: <理由>` と表示します。
+実行しなかった HookAction は、右ペインに `[owner/repo] #n   skipped (<HookType>): <理由>` と表示します。
 
 ### Hook の実行順序
 
