@@ -21,15 +21,23 @@ gh-board-cli
 | --- | --- |
 | `q` / `Esc` / `Ctrl-C` | 終了 |
 | `r` | ボード再読込 |
-| `Tab` | ペイン切替 |
-| `j` / `k` / `↑` / `↓` | スクロール |
-| `G` / `End` | イベントログの末尾に追従 |
+| `Tab` | ペイン切替 (Projects → Issues → Progress) |
+| `j` / `k` / `↑` / `↓` | Projects: Project 選択 / その他: スクロール |
+| `G` / `End` | Progress の末尾に追従 |
+| クリック (Project) | Project を選択 |
 | クリック (`#n ...`) | Issue をブラウザで開く (`gh issue view --web`) |
-| ホイール | カーソル下のペインをスクロール |
+| ホイール | カーソル下のペインをスクロール（Projects では選択を移動） |
 
-- 左ペインは `gh project list` で取得した開いている Project ごとに、Status 別の Issue を表示します（Done は更新日時が新しい順に最大10件）
-- 🟢 はその Issue のイベントに一致した Hook を実行中であることを示します
-- 右ペインには受信イベントと Hook の出力を表示します。Hook の出力は1行ずつ届いた時点で表示し、`[#n]` でどの Issue の Hook かを示します
+画面は3ペイン構成です。
+
+| 左上: Projects | 右: Progress |
+| --- | --- |
+| 左下: Issues | 〃 |
+
+- Projects には `gh project list` で取得した開いている Project を一覧表示します
+- Issues には Projects で選択中の Project の Issue を Status 別に表示します（Done は更新日時が新しい順に最大10件）
+- 🟢 はその Issue（Projects ではその Project 内の Issue）のイベントに一致した Hook を実行中であることを示します
+- Progress には受信イベントと Hook の出力を表示します。Hook の出力は1行ずつ届いた時点で表示し、`[#n]` でどの Issue の Hook かを示します
 - マウス入力を有効にしているため、ターミナルでの文字選択は Shift (iTerm2 / Terminal.app では Option) を押しながら行ってください
 
 ## 設定 (`.ghboard.yaml`)
