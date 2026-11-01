@@ -57,8 +57,9 @@ pub struct LogLine {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Focus {
-    Board,
-    Log,
+    Projects,
+    Issues,
+    Progress,
 }
 
 pub struct App {
@@ -78,13 +79,18 @@ pub struct App {
     pub status: String,
 
     pub focus: Focus,
-    pub board_scroll: u16,
+    /// Index of the project shown in the issues pane
+    pub selected_project: usize,
+    /// Scroll position of the projects pane, updated by the renderer
+    pub projects_scroll: u16,
+    pub issues_scroll: u16,
     /// `None` follows the latest log
     pub log_scroll: Option<u16>,
     /// Scroll position of the bottom of the log, updated by the renderer
     pub log_bottom_hint: u16,
     /// Pane areas and clickable issue rows, updated by the renderer
-    pub board_area: Rect,
+    pub projects_area: Rect,
+    pub issues_area: Rect,
     pub log_area: Rect,
     pub issue_links: Vec<(Rect, IssueKey)>,
     pub quit: bool,
@@ -105,11 +111,14 @@ impl App {
             active_issues: HashMap::new(),
             log: vec![],
             status: String::new(),
-            focus: Focus::Board,
-            board_scroll: 0,
+            focus: Focus::Projects,
+            selected_project: 0,
+            projects_scroll: 0,
+            issues_scroll: 0,
             log_scroll: None,
             log_bottom_hint: 0,
-            board_area: Rect::default(),
+            projects_area: Rect::default(),
+            issues_area: Rect::default(),
             log_area: Rect::default(),
             issue_links: vec![],
             quit: false,
@@ -150,6 +159,8 @@ impl App {
                 self.loading = false;
                 match result {
                     Ok(board) => {
+                        let last = board.projects.len().saturating_sub(1);
+                        self.selected_project = self.selected_project.min(last);
                         self.board = Some(board);
                         self.board_error = None;
                     }
@@ -172,29 +183,38 @@ impl App {
             KeyCode::Char('r') => self.refresh_board(),
             KeyCode::Tab => {
                 self.focus = match self.focus {
-                    Focus::Board => Focus::Log,
-                    Focus::Log => Focus::Board,
+                    Focus::Projects => Focus::Issues,
+                    Focus::Issues => Focus::Progress,
+                    Focus::Progress => Focus::Projects,
                 }
             }
             KeyCode::Char('j') | KeyCode::Down => self.scroll(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll(-1),
-            KeyCode::Char('G') | KeyCode::End if self.focus == Focus::Log => self.log_scroll = None,
+            KeyCode::Char('G') | KeyCode::End if self.focus == Focus::Progress => {
+                self.log_scroll = None
+            }
             _ => {}
         }
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
         let pos = Position::new(mouse.column, mouse.row);
-        let pane = if self.board_area.contains(pos) {
-            Focus::Board
+        let pane = if self.projects_area.contains(pos) {
+            Focus::Projects
+        } else if self.issues_area.contains(pos) {
+            Focus::Issues
         } else if self.log_area.contains(pos) {
-            Focus::Log
+            Focus::Progress
         } else {
             return;
         };
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.focus = pane;
+                if pane == Focus::Projects {
+                    self.click_project(pos);
+                    return;
+                }
                 let link = self.issue_links.iter().find(|(r, _)| r.contains(pos));
                 if let Some((_, (repository, number))) = link.cloned() {
                     self.open_issue(repository, number);
@@ -227,6 +247,28 @@ impl App {
         });
     }
 
+    /// Select the project at the clicked row of the projects pane
+    fn click_project(&mut self, pos: Position) {
+        let Some(row) = pos.y.checked_sub(self.projects_area.y + 1) else {
+            return;
+        };
+        let index = (row + self.projects_scroll) as usize;
+        if index < self.project_count() {
+            self.select_project(index);
+        }
+    }
+
+    fn select_project(&mut self, index: usize) {
+        if index != self.selected_project {
+            self.selected_project = index;
+            self.issues_scroll = 0;
+        }
+    }
+
+    fn project_count(&self) -> usize {
+        self.board.as_ref().map_or(0, |b| b.projects.len())
+    }
+
     fn scroll(&mut self, delta: i32) {
         self.scroll_pane(self.focus, delta);
     }
@@ -234,8 +276,13 @@ impl App {
     fn scroll_pane(&mut self, pane: Focus, delta: i32) {
         let apply = |v: u16| (v as i32 + delta).max(0) as u16;
         match pane {
-            Focus::Board => self.board_scroll = apply(self.board_scroll),
-            Focus::Log => {
+            Focus::Projects => {
+                let last = self.project_count().saturating_sub(1) as i32;
+                let index = (self.selected_project as i32 + delta).clamp(0, last);
+                self.select_project(index as usize);
+            }
+            Focus::Issues => self.issues_scroll = apply(self.issues_scroll),
+            Focus::Progress => {
                 // Detach from the bottom using the last rendered position
                 let current = self.log_scroll.unwrap_or(self.log_bottom_hint);
                 self.log_scroll = Some(apply(current));
