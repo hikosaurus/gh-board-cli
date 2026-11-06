@@ -9,7 +9,7 @@ mise install
 cargo build --release
 ```
 
-[gh](https://cli.github.com/) にログイン済みであること（`gh project list` / `gh api graphql` / `gh issue view` を使用します）。Project の取得には `read:project` スコープが必要です（`gh auth refresh -s read:project`）。
+[gh](https://cli.github.com/) にログイン済みであること（`gh project list` / `gh api graphql` / `gh issue view` を使用します。所属 Organization の取得には `read:org` スコープが必要です）。Project の取得には `read:project` スコープが必要です（`gh auth refresh -s read:project`）。
 
 ## Usage
 
@@ -34,7 +34,9 @@ gh-board-cli
 | --- | --- |
 | 左下: Issues | 〃 |
 
-- Projects には `gh project list` で取得した開いている Project を一覧表示します
+- Projects には、自分がアクセスできる開いている Project を一覧表示します（オーナーでなくても表示されます）
+  - 自分・所属 Organization・アクセスできるリポジトリのオーナーそれぞれについて `gh project list --owner` で取得します
+  - 上記のどれにも当てはまらないオーナーの Project（リポジトリへのアクセス権がなく、Project だけ共有されている場合など）は表示されません
 - Issues には Projects で選択中の Project の Issue を Status 別に表示します（Done は更新日時が新しい順に最大10件）
 - 🟢 はその Issue（Projects ではその Project 内の Issue）のイベントに一致した Hook を実行中であることを示します
 - Progress には受信イベントと Hook の出力を表示します。Hook の出力は1行ずつ届いた時点で表示し、`[#n]` でどの Issue の Hook かを示します
