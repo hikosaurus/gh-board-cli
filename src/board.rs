@@ -60,12 +60,100 @@ pub struct Board {
     pub projects: Vec<Project>,
 }
 
-/// Fetch open projects (`gh project list`) and their issues (`gh api graphql`).
+/// Owners whose projects may be accessible: the viewer, organizations of the
+/// viewer and owners of repositories the viewer can access.
+const OWNERS_QUERY: &str = r#"
+query($after: String) {
+  viewer {
+    login
+    organizations(first: 100) { nodes { login } }
+    repositories(first: 100, after: $after, affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER]) {
+      pageInfo { hasNextPage endCursor }
+      nodes { owner { login } }
+    }
+  }
+}
+"#;
+
+/// Fetch open projects accessible to the viewer (`gh project list --owner`
+/// for each owner) and their issues (`gh api graphql`).
 pub async fn fetch() -> Result<Board> {
-    let list = gh(&["project", "list", "--format", "json", "--limit", "100"]).await?;
-    let projects = parse_projects(&list);
+    let (viewer, others) = fetch_owners().await?;
+    let mut lists = vec![list_projects(&viewer).await?];
+    // Projects of other owners are optional: skip owners that cannot be listed.
+    let others = futures_util::future::join_all(others.iter().map(|o| list_projects(o))).await;
+    lists.extend(others.into_iter().flatten());
+
+    let mut projects: Vec<Project> = vec![];
+    for project in lists.iter().flat_map(parse_projects) {
+        if projects.iter().all(|p| p.id != project.id) {
+            projects.push(project);
+        }
+    }
     let projects = try_join_all(projects.into_iter().map(fetch_items)).await?;
     Ok(Board { projects })
+}
+
+async fn list_projects(owner: &str) -> Result<Value> {
+    gh(&[
+        "project", "list", "--owner", owner, "--format", "json", "--limit", "100",
+    ])
+    .await
+}
+
+/// The viewer login and other candidate owners (organizations first, then
+/// repository owners), without duplicates.
+async fn fetch_owners() -> Result<(String, Vec<String>)> {
+    let mut viewer = String::new();
+    let mut owners: Vec<String> = vec![];
+    let mut after: Option<String> = None;
+    loop {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".into(),
+            "-f".into(),
+            format!("query={OWNERS_QUERY}"),
+        ];
+        if let Some(after) = &after {
+            args.extend(["-F".into(), format!("after={after}")]);
+        }
+        let page = gh(&args).await?;
+        let data = &page["data"]["viewer"];
+        if viewer.is_empty() {
+            viewer = data["login"].as_str().unwrap_or_default().to_string();
+        }
+        for owner in parse_owners(data) {
+            if owner != viewer && !owners.contains(&owner) {
+                owners.push(owner);
+            }
+        }
+
+        let page_info = &data["repositories"]["pageInfo"];
+        if page_info["hasNextPage"].as_bool() != Some(true) {
+            break;
+        }
+        after = page_info["endCursor"].as_str().map(str::to_string);
+    }
+    Ok((viewer, owners))
+}
+
+/// Organization logins and repository owner logins in a page of `OWNERS_QUERY`.
+fn parse_owners(viewer: &Value) -> Vec<String> {
+    let logins = |nodes: &Value, path: &[&str]| -> Vec<String> {
+        nodes
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| path.iter().fold(n, |v, key| &v[key]).as_str())
+            .map(str::to_string)
+            .collect()
+    };
+    let mut owners = logins(&viewer["organizations"]["nodes"], &["login"]);
+    owners.extend(logins(
+        &viewer["repositories"]["nodes"],
+        &["owner", "login"],
+    ));
+    owners
 }
 
 /// Open projects in `gh project list --format json`.
@@ -197,6 +285,20 @@ fn limit_done(project: &mut Project) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn parse_candidate_owners() {
+        let viewer = json!({
+            "login": "me",
+            "organizations": { "nodes": [{ "login": "org" }] },
+            "repositories": { "nodes": [
+                { "owner": { "login": "me" } },
+                { "owner": { "login": "friend" } }
+            ] }
+        });
+        assert_eq!(parse_owners(&viewer), ["org", "me", "friend"]);
+        assert!(parse_owners(&json!({})).is_empty());
+    }
 
     #[test]
     fn parse_open_projects() {
