@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::time::Instant;
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -30,6 +31,9 @@ pub enum AppEvent {
     Status(String),
     /// Payload received from WebSocket
     Received(Payload),
+    /// Payload detected by the browser watcher, with the time when the
+    /// previous snapshot of the project was taken
+    Watched(Payload, Instant),
     /// Output of a running hook action (log tag, output)
     HookOutput(String, HookOutput),
     /// Hook action finished (issue, log tag, exit code)
@@ -75,6 +79,8 @@ pub struct App {
     refresh_pending: bool,
     /// Issue -> count of hook actions not yet finished
     pub active_issues: HashMap<IssueKey, usize>,
+    /// Issue -> time when its last hook action finished
+    hook_finished: HashMap<IssueKey, Instant>,
     pub log: Vec<LogLine>,
     pub status: String,
 
@@ -109,6 +115,7 @@ impl App {
             loading: false,
             refresh_pending: false,
             active_issues: HashMap::new(),
+            hook_finished: HashMap::new(),
             log: vec![],
             status: String::new(),
             focus: Focus::Projects,
@@ -145,9 +152,13 @@ impl App {
             AppEvent::Redraw => {}
             AppEvent::Status(status) => self.status = status,
             AppEvent::Received(payload) => self.on_received(payload),
+            AppEvent::Watched(payload, since) => self.on_watched(payload, since),
             AppEvent::HookOutput(tag, output) => self.on_hook_output(&tag, output),
             AppEvent::HookDone(issue, tag, status) => {
                 self.finish_actions(issue.as_ref(), 1);
+                if let Some(key) = issue {
+                    self.hook_finished.insert(key, Instant::now());
+                }
                 let status = status.map_or("killed".to_string(), |c| c.to_string());
                 self.push(LogKind::Exit, format!("  [{tag}] exit {status}"));
             }
@@ -334,6 +345,31 @@ impl App {
         self.refresh_board();
     }
 
+    /// Status changes detected while (or since the previous snapshot) a hook
+    /// of the issue ran are regarded as made by the hook, and ignored so that
+    /// `issues:edited` hooks do not loop.
+    fn on_watched(&mut self, payload: Payload, since: Instant) {
+        if payload.event_action == "edited"
+            && let Some(number) = payload.issue_number
+        {
+            let key = issue_key(&payload.repository, number);
+            let by_hook = self.active_issues.contains_key(&key)
+                || self.hook_finished.get(&key).is_some_and(|t| *t >= since);
+            if by_hook {
+                self.push(
+                    LogKind::Skipped,
+                    format!(
+                        "⚡️ #{number} {} ({}: status changed while its hook ran)",
+                        payload.hook_type(),
+                        payload.repository
+                    ),
+                );
+                return;
+            }
+        }
+        self.on_received(payload);
+    }
+
     fn on_hook_output(&mut self, tag: &str, output: HookOutput) {
         let (kind, text) = match output {
             HookOutput::Started(command) => (LogKind::Command, format!("$ {command}")),
@@ -509,6 +545,48 @@ mod tests {
         app.handle(AppEvent::Received(payload("owner/repo", "issues")));
         app.handle(AppEvent::HookSkipped(Some(key), 2, "no new comment".into()));
         assert!(app.active_issues.is_empty());
+    }
+
+    fn watched(action: &str) -> Payload {
+        Payload::from_value(json!({
+            "repository": "owner/repo",
+            "event_name": "issues",
+            "event_action": action,
+            "issue_number": 3
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn ignore_status_changes_by_hook() {
+        let mut app = app(r#"{
+            "listen": "ws://x",
+            "hooks": [{ "on": ["issues:*"], "command": "true" }]
+        }"#);
+        let key = issue_key("owner/repo", 3);
+        let before_hook = Instant::now();
+
+        app.handle(AppEvent::Watched(watched("edited"), before_hook));
+        assert_eq!(app.active_issues.get(&key), Some(&1));
+
+        // changed while the hook is running
+        app.handle(AppEvent::Watched(watched("edited"), Instant::now()));
+        assert_eq!(app.active_issues.get(&key), Some(&1));
+        assert_eq!(app.log.last().unwrap().kind, LogKind::Skipped);
+
+        // changed after the previous snapshot, and the hook finished meanwhile
+        app.handle(AppEvent::HookDone(Some(key.clone()), "#3".into(), Some(0)));
+        app.handle(AppEvent::Watched(watched("edited"), before_hook));
+        assert!(app.active_issues.is_empty());
+
+        // new issues are not ignored
+        app.handle(AppEvent::Watched(watched("opened"), before_hook));
+        assert_eq!(app.active_issues.get(&key), Some(&1));
+        app.handle(AppEvent::HookDone(Some(key.clone()), "#3".into(), Some(0)));
+
+        // changed after the hook finished and the next snapshot was taken
+        app.handle(AppEvent::Watched(watched("edited"), Instant::now()));
+        assert_eq!(app.active_issues.get(&key), Some(&1));
     }
 
     #[tokio::test]

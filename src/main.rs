@@ -5,6 +5,7 @@ mod hook;
 mod listener;
 mod payload;
 mod ui;
+mod watcher;
 
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
@@ -31,11 +32,16 @@ async fn main() -> Result<()> {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    tokio::spawn(listener::listen(
-        config.listen.clone(),
-        config.channel.clone(),
-        tx.clone(),
-    ));
+    if let Some(listen) = &config.listen {
+        tokio::spawn(listener::listen(
+            listen.clone(),
+            config.channel.clone(),
+            tx.clone(),
+        ));
+    }
+    if !config.projects.is_empty() {
+        tokio::spawn(watcher::watch(config.projects.clone(), tx.clone()));
+    }
 
     let input_tx = tx.clone();
     std::thread::spawn(move || {

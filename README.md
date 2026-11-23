@@ -11,6 +11,8 @@ cargo build --release
 
 [gh](https://cli.github.com/) にログイン済みであること（`gh project list` / `gh api graphql` / `gh issue view` を使用します。所属 Organization の取得には `read:org` スコープが必要です）。Project の取得には `read:project` スコープが必要です（`gh auth refresh -s read:project`）。
 
+`projects` でブラウザによる監視を使う場合は、Google Chrome（または Chromium）が必要です。
+
 ## Usage
 
 ```sh
@@ -52,6 +54,8 @@ YAML 形式の設定ファイルを、次の順で探して最初に見つかっ
 ```yaml
 listen: wss://ws-{cluster}.pusher.com/app/{app_key}?protocol=7&client=rust&version=1.0.0
 channel: gh-board
+projects:
+  - https://github.com/users/owner/projects/1
 targets:
   - owner/repo01
   - owner/repo02
@@ -72,8 +76,10 @@ hooks:
 > [!TIP]
 > YAML では、値に ` #`（コメント扱い）や `: ` が含まれると意図どおりに読み込まれません。`command` はクォートで囲むか、`|` のブロック形式で書くと安全です。
 
-- `listen`: 購読する WebSocket の URL
+- `listen` (任意): 購読する WebSocket の URL
 - `channel` (任意): Pusher のチャンネル名。指定時は接続後に `pusher:subscribe` を送信します
+- `projects` (任意): ブラウザで監視する Project の URL の配列（[ブラウザによる監視](#ブラウザによる監視)）
+  - `listen` と `projects` のどちらかは必須です。両方指定した場合は両方で監視します
 - `targets` (任意): Hook の対象リポジトリ。空・未指定なら全リポジトリが対象です
 - `hooks`: HookAction の配列
   - `on`: 実行対象とする HookType の配列。いずれかに一致すれば実行します
@@ -109,6 +115,26 @@ hooks:
 - `issue_number`: Issue 番号（数値または数字の文字列）。🟢 の表示に使います
 
 Pusher の envelope（`{"event": "...", "data": "<payload の JSON 文字列>"}`）で届いた場合は `data` を展開します。
+
+### ブラウザによる監視
+
+GitHub API のレートリミットなどで WebSocket による監視ができない場合のために、`projects` に指定した Project をブラウザ（headless Chrome）で監視し、Hook を実行できます。
+
+- 10秒ごとに Project 画面を取得し、前回との差分から次のイベントを検知します（起動直後の1回目は記録のみ）
+  - Project に Issue が追加された: `issues:opened`
+  - Issue の Status が変わった: `issues:edited`
+- 検知したイベントは、WebSocket で受信した payload と同じように Hook の実行条件を判定して実行します
+  - payload には次の項目が加わります
+    - `status`: 変更後の Status 名（未設定なら空文字）
+    - `previous_status`: 変更前の Status 名（`issues:edited` のみ）
+    - `project`: Project の URL
+- Hook の実行中、または前回の取得以降に Hook が終了した Issue の `issues:edited` は、Hook による変更とみなして実行しません（Hook 内で Status を変更したときのループ防止）
+- Project 画面に埋め込まれたデータと、画面が使う内部エンドポイントから読み取るため、GitHub API（`api.github.com`）は使いません
+  - Hook の実行条件の判定（`status`・コメント）には、これまで通り `gh` を使います
+- GitHub のセッションは、この CLI 専用の Chrome プロファイル（`~/.ghboard/browser`）に保存します
+  - ログインしていない場合はブラウザのウィンドウが開くので、GitHub にログインしてください。ログインが完了すると、ウィンドウを閉じて監視を始めます
+- 状態は下部のステータス行に `browser: ...` と表示します
+- GitHub の画面構成が変わると、読み取れなくなることがあります
 
 ### Hook の実行条件
 
