@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::time::Instant;
 
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -30,6 +31,9 @@ pub enum AppEvent {
     Status(String),
     /// Payload received from WebSocket
     Received(Payload),
+    /// Payload detected by the browser watcher, with the time when the
+    /// previous snapshot of the project was taken
+    Watched(Payload, Instant),
     /// Output of a running hook action (log tag, output)
     HookOutput(String, HookOutput),
     /// Hook action finished (issue, log tag, exit code)
@@ -144,7 +148,9 @@ impl App {
             AppEvent::Mouse(mouse) => self.on_mouse(mouse),
             AppEvent::Redraw => {}
             AppEvent::Status(status) => self.status = status,
-            AppEvent::Received(payload) => self.on_received(payload),
+            AppEvent::Received(payload) | AppEvent::Watched(payload, _) => {
+                self.on_received(payload)
+            }
             AppEvent::HookOutput(tag, output) => self.on_hook_output(&tag, output),
             AppEvent::HookDone(issue, tag, status) => {
                 self.finish_actions(issue.as_ref(), 1);

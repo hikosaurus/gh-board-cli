@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+chromiumoxide = { version = "0.9.1", default-features = false }
 futures-util = "0.3.34"
 ratatui = "0.30.2"
 regex = "1.13.1"

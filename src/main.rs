@@ -5,6 +5,7 @@ mod hook;
 mod listener;
 mod payload;
 mod ui;
+mod watcher;
 
 use anyhow::{Context, Result, bail};
 use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
@@ -37,6 +38,9 @@ async fn main() -> Result<()> {
             config.channel.clone(),
             tx.clone(),
         ));
+    }
+    if !config.projects.is_empty() {
+        tokio::spawn(watcher::watch(config.projects.clone(), tx.clone()));
     }
 
     let input_tx = tx.clone();
