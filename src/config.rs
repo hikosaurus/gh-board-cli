@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 /// Config file names in lookup order.
@@ -8,14 +8,18 @@ pub const CONFIG_FILE_NAMES: [&str; 2] = [".ghboard.yaml", ".ghboard.yml"];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// WebSocket URL to subscribe
-    pub listen: String,
+    /// WebSocket URL to subscribe (optional)
+    #[serde(default)]
+    pub listen: Option<String>,
     /// Pusher channel to subscribe after connection (optional)
     #[serde(default)]
     pub channel: Option<String>,
     /// Repositories (`{owner}/{repo}`) to handle. Empty means all repositories.
     #[serde(default)]
     pub targets: Vec<String>,
+    /// Project URLs to watch with the browser (optional)
+    #[serde(default)]
+    pub projects: Vec<String>,
     /// Hook actions in config order
     #[serde(default)]
     pub hooks: Vec<HookAction>,
@@ -46,7 +50,16 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        Ok(serde_yaml_ng::from_str(text)?)
+        let config: Self = serde_yaml_ng::from_str(text)?;
+        if config.listen.is_none() && config.projects.is_empty() {
+            bail!("either `listen` or `projects` is required");
+        }
+        for url in &config.projects {
+            if !is_project_url(url) {
+                bail!("invalid project URL: {url}");
+            }
+        }
+        Ok(config)
     }
 
     pub fn is_target(&self, repository: &str) -> bool {
@@ -67,6 +80,21 @@ impl Config {
             .flat_map(|dir| CONFIG_FILE_NAMES.map(|name| dir.join(name)))
             .find(|path| path.is_file())
     }
+}
+
+/// `https://github.com/{users|orgs}/{owner}/projects/{number}` (optionally
+/// followed by a view path or query)
+pub fn is_project_url(url: &str) -> bool {
+    let Some(path) = url.strip_prefix("https://github.com/") else {
+        return false;
+    };
+    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let segments: Vec<&str> = path.split('/').collect();
+    matches!(
+        segments[..],
+        ["users" | "orgs", owner, "projects", number, ..]
+            if !owner.is_empty() && number.parse::<u64>().is_ok()
+    )
 }
 
 #[cfg(test)]
@@ -90,7 +118,7 @@ hooks:
 "#,
         )
         .unwrap();
-        assert_eq!(config.listen, "wss://example.com/app/key");
+        assert_eq!(config.listen.as_deref(), Some("wss://example.com/app/key"));
         assert_eq!(config.channel, None);
         assert_eq!(
             config.hooks,
@@ -167,6 +195,31 @@ hooks:
                     .into()
             }
         );
+    }
+
+    #[test]
+    fn listen_or_projects_is_required() {
+        assert!(Config::parse("hooks: []").is_err());
+        let config =
+            Config::parse("projects:\n  - https://github.com/users/me/projects/6").unwrap();
+        assert_eq!(config.listen, None);
+        assert_eq!(config.projects, ["https://github.com/users/me/projects/6"]);
+        assert!(Config::parse("projects:\n  - https://github.com/me/repo").is_err());
+    }
+
+    #[test]
+    fn project_url() {
+        assert!(is_project_url("https://github.com/users/me/projects/6"));
+        assert!(is_project_url(
+            "https://github.com/orgs/org/projects/1/views/2"
+        ));
+        assert!(is_project_url(
+            "https://github.com/orgs/org/projects/1?pane=info"
+        ));
+        assert!(!is_project_url("https://github.com/users/me/projects/x"));
+        assert!(!is_project_url("https://github.com/users/me/projects"));
+        assert!(!is_project_url("https://github.com/me/repo/projects/1"));
+        assert!(!is_project_url("http://github.com/users/me/projects/6"));
     }
 
     #[test]
